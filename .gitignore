@@ -1,0 +1,53 @@
+# Memory data
+agent_memory/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+*.js
+*.js.map
+*.d.ts
+!index.js
+
+# Database
+agent_memory/
+*.db
+*.db-journal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/

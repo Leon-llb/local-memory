@@ -1,0 +1,85 @@
+{
+  "id": "local-memory",
+  "name": "Local Memory",
+  "version": "2.0.0",
+  "description": "Local vector memory system with semantic chunking, dedup, TTL, and re-rank",
+  "author": "Leon",
+  "license": "MIT",
+  "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/openclaw-local-memory"
+  },
+  "keywords": ["memory", "vector", "rag", "chromadb"],
+  "uiHints": {
+    "serviceUrl": {
+      "label": "服务地址",
+      "help": "Python 记忆服务的 HTTP 地址"
+    },
+    "autoStart": {
+      "label": "自动启动",
+      "help": "OpenClaw 启动时自动启动 Python 服务"
+    },
+    "autoInject": {
+      "label": "自动注入",
+      "help": "在 agent 启动时自动注入相关记忆到上下文"
+    },
+    "injectTopK": {
+      "label": "注入数量",
+      "help": "自动注入时检索的记忆条数"
+    },
+    "injectThreshold": {
+      "label": "相似度阈值",
+      "help": "低于此值的记忆不会被注入 (0-1)"
+    },
+    "healthCheckInterval": {
+      "label": "健康检查间隔",
+      "help": "检查 Python 服务健康状态的间隔 (毫秒)"
+    },
+    "scriptPath": {
+      "label": "启动脚本路径",
+      "help": "Python 服务的启动脚本路径"
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "serviceUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:37888"
+      },
+      "autoStart": {
+        "type": "boolean",
+        "default": true
+      },
+      "autoInject": {
+        "type": "boolean",
+        "default": true
+      },
+      "injectTopK": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "default": 3
+      },
+      "injectThreshold": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.5
+      },
+      "healthCheckInterval": {
+        "type": "integer",
+        "minimum": 10000,
+        "default": 60000
+      },
+      "scriptPath": {
+        "type": "string"
+      }
+    }
+  }
+}
