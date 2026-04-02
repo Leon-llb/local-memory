@@ -11,6 +11,7 @@
  */
 
 import { spawn, ChildProcess } from 'child_process';
+import { promises as fs } from 'fs';
 import path from 'path';
 
 interface PluginLogger {
@@ -88,6 +89,7 @@ interface OpenClawPluginApi {
     start: (ctx: PluginServiceContext) => void | Promise<void>;
     stop?: (ctx: PluginServiceContext) => void | Promise<void>;
   }) => void;
+  registerMemoryRuntime?: (runtime: MemoryPluginRuntime) => void;
   registerCommand: (command: {
     name: string;
     description: string;
@@ -114,12 +116,108 @@ type MemoryLayer =
   | 'session_episode'
   | 'archive';
 
+type WorkflowGate = 'delegation' | 'advisor' | 'verification';
+type WorkflowRisk = 'low' | 'medium' | 'high';
+
+type WorkflowDecision = {
+  gates: WorkflowGate[];
+  risk: WorkflowRisk;
+  reasons: string[];
+  route: string[];
+  signature: string;
+};
+
+type WorkflowSessionState = {
+  signature: string;
+  gateKey: string;
+  risk: WorkflowRisk;
+};
+
+type WorkflowArtifactKind = 'delegate' | 'advisor' | 'verify';
+
+type MemoryProviderStatus = {
+  backend: 'builtin' | 'qmd';
+  provider: string;
+  workspaceDir?: string;
+  dbPath?: string;
+  vector?: {
+    enabled: boolean;
+    available?: boolean;
+  };
+  custom?: Record<string, unknown>;
+};
+
+type MemoryEmbeddingProbeResult = {
+  ok: boolean;
+  error?: string;
+};
+
+type MemorySyncProgressUpdate = {
+  completed: number;
+  total: number;
+  label?: string;
+};
+
+type MemorySearchResult = {
+  path: string;
+  startLine: number;
+  endLine: number;
+  score: number;
+  snippet: string;
+  source: 'memory' | 'sessions';
+  citation?: string;
+};
+
+interface MemorySearchManager {
+  search(
+    query: string,
+    opts?: { maxResults?: number; minScore?: number; sessionKey?: string },
+  ): Promise<MemorySearchResult[]>;
+  readFile(params: {
+    relPath: string;
+    from?: number;
+    lines?: number;
+  }): Promise<{ text: string; path: string }>;
+  status(): MemoryProviderStatus;
+  sync?(params?: {
+    reason?: string;
+    force?: boolean;
+    sessionFiles?: string[];
+    progress?: (update: MemorySyncProgressUpdate) => void;
+  }): Promise<void>;
+  probeEmbeddingAvailability(): Promise<MemoryEmbeddingProbeResult>;
+  probeVectorAvailability(): Promise<boolean>;
+  close?(): Promise<void>;
+}
+
+interface MemoryPluginRuntime {
+  getMemorySearchManager(params: {
+    cfg: unknown;
+    agentId: string;
+    purpose?: 'default' | 'status';
+  }): Promise<{
+    manager: MemorySearchManager | null;
+    error?: string;
+  }>;
+  resolveMemoryBackendConfig(params: {
+    cfg: unknown;
+    agentId: string;
+  }): {
+    backend: 'builtin' | 'qmd';
+    qmd?: Record<string, unknown>;
+  };
+  closeAllMemorySearchManagers?(): Promise<void>;
+}
+
 interface LocalMemoryConfig {
   serviceUrl?: string;
   autoStart?: boolean;
   autoInject?: boolean;
   autoReflect?: boolean;
+  autoWorkflowHints?: boolean;
   autoArchive?: boolean;
+  archiveAfterDays?: number;
+  archiveCheckIntervalMinutes?: number;
   injectTopK?: number;
   injectThreshold?: number;
   injectStrategy?: InjectStrategy;
@@ -127,8 +225,6 @@ interface LocalMemoryConfig {
   dbPath?: string;
   healthCheckInterval?: number;
   ttlDays?: number;
-  archiveAfterDays?: number;
-  archiveCheckIntervalMinutes?: number;
   defaultVisibility?: Visibility;
 }
 
@@ -137,7 +233,10 @@ interface RuntimeConfig {
   autoStart: boolean;
   autoInject: boolean;
   autoReflect: boolean;
+  autoWorkflowHints: boolean;
   autoArchive: boolean;
+  archiveAfterDays: number;
+  archiveCheckIntervalMinutes: number;
   injectTopK: number;
   injectThreshold: number;
   injectStrategy: InjectStrategy;
@@ -145,20 +244,38 @@ interface RuntimeConfig {
   dbPath: string;
   healthCheckInterval: number;
   ttlDays: number;
-  archiveAfterDays: number;
-  archiveCheckIntervalMinutes: number;
   defaultVisibility: Visibility;
 }
 
 let memoryServiceProcess: ChildProcess | null = null;
 let serviceReady = false;
 let healthCheckTimer: ReturnType<typeof setInterval> | null = null;
+let archiveTimer: ReturnType<typeof setInterval> | null = null;
 let consecutiveFailures = 0;
 let activeRuntimeConfig: RuntimeConfig | null = null;
 let lastKnownWorkspaceDir: string | undefined;
-let lastAutoArchiveAt = 0;
+let healthCheckInFlight = false;
+let archiveSweepInFlight = false;
+let restartInProgress: Promise<boolean> | null = null;
 const MAX_FAILURES = 3;
 const sessionToolEvents = new Map<string, string[]>();
+const workflowSessionStates = new Map<string, WorkflowSessionState>();
+const memoryVirtualFiles = new Map<string, { path: string; text: string }>();
+const DEFAULT_BLACKBOARD_ROOT = '/Users/leon/clawd/workspace/blackboard';
+const WORKFLOW_SYSTEM_POLICY = [
+  '<openclaw-workflow-policy>',
+  '- If a workflow gate is marked required, run it before claiming implementation or completion.',
+  '- Keep gate context short: write only delta evidence instead of replaying the whole chat.',
+  '- Prefer blackboard files for durable handoff and review artifacts.',
+  '</openclaw-workflow-policy>',
+].join('\n');
+const MAX_WORKFLOW_SESSION_STATES = 256;
+let blackboardRoot = DEFAULT_BLACKBOARD_ROOT;
+const noopLogger: PluginLogger = {
+  info: () => undefined,
+  warn: () => undefined,
+  error: () => undefined,
+};
 
 function asBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
@@ -209,6 +326,434 @@ function flattenMessageContent(
 
 function getSessionIdentifier(ctx: EventContext): string {
   return ctx.sessionKey || ctx.agentId || 'default-session';
+}
+
+function hasPattern(text: string, patterns: RegExp[]): boolean {
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+function flattenUnknownMessage(message: unknown): string {
+  if (!message || typeof message !== 'object') {
+    return '';
+  }
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (!item || typeof item !== 'object') {
+          return '';
+        }
+        const text = (item as { text?: unknown }).text;
+        return typeof text === 'string' ? text : '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  return '';
+}
+
+function buildWorkflowPrompt(prompt: string, messages?: unknown[]): string {
+  const parts = [prompt.trim()];
+  const recentMessages = Array.isArray(messages) ? messages.slice(-6) : [];
+  for (const message of recentMessages) {
+    const flattened = flattenUnknownMessage(message).trim();
+    if (flattened) {
+      parts.push(flattened);
+    }
+  }
+  return parts.filter(Boolean).join('\n');
+}
+
+function normalizeWorkflowText(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function simpleHash(text: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function inferWorkflowDecision(prompt: string, messages?: unknown[]): WorkflowDecision {
+  const text = buildWorkflowPrompt(prompt, messages);
+  if (!text) {
+    return {
+      gates: [],
+      risk: 'low',
+      reasons: [],
+      route: [],
+      signature: 'empty',
+    };
+  }
+
+  const delegationPatterns = [
+    /派单/i,
+    /拆解/i,
+    /分工/i,
+    /多智能体/i,
+    /子任务/i,
+    /并行/i,
+    /handoff/i,
+    /delegate/i,
+    /delegation/i,
+    /subagent/i,
+    /orchestr/i,
+    /workflow/i,
+    /route/i,
+  ];
+
+  const advisorPatterns = [
+    /架构/i,
+    /重构/i,
+    /refactor/i,
+    /rewrite/i,
+    /migration/i,
+    /迁移/i,
+    /prompt/i,
+    /提示词/i,
+    /system prompt/i,
+    /hook/i,
+    /plugin/i,
+    /插件/i,
+    /config/i,
+    /配置/i,
+    /release/i,
+    /上线/i,
+    /deploy/i,
+    /strategy/i,
+    /方案/i,
+    /路线/i,
+    /agent/i,
+  ];
+
+  const verificationPatterns = [
+    /验证/i,
+    /验收/i,
+    /review/i,
+    /qa/i,
+    /测试/i,
+    /test/i,
+    /typecheck/i,
+    /build/i,
+    /回归/i,
+    /regression/i,
+    /检查/i,
+    /审查/i,
+    /gate/i,
+    /上线/i,
+    /release/i,
+    /merge/i,
+    /\bpr\b/i,
+  ];
+
+  const stabilityPatterns = [
+    /稳定/i,
+    /长期运行/i,
+    /long[- ]term/i,
+    /production/i,
+    /上线/i,
+    /发布/i,
+    /掉链子/i,
+    /reliab/i,
+  ];
+
+  const riskPatterns = [
+    /数据库/i,
+    /db\b/i,
+    /schema/i,
+    /memory/i,
+    /记忆/i,
+    /隐私/i,
+    /privacy/i,
+    /cost/i,
+    /路由/i,
+    /router/i,
+    /自动化/i,
+    /automation/i,
+    /agent/i,
+  ];
+
+  const gates = new Set<WorkflowGate>();
+  const reasons: string[] = [];
+  let riskScore = 0;
+
+  if (hasPattern(text, delegationPatterns)) {
+    gates.add('delegation');
+    riskScore += 1;
+    reasons.push('task requires delegation or multi-agent routing');
+  }
+  if (hasPattern(text, advisorPatterns)) {
+    gates.add('advisor');
+    riskScore += 2;
+    reasons.push('task changes architecture, prompts, tools, plugins, or configs');
+  }
+  if (hasPattern(text, verificationPatterns)) {
+    gates.add('verification');
+    riskScore += 2;
+    reasons.push('task requires review, tests, regression, or release confidence');
+  }
+  if (hasPattern(text, stabilityPatterns)) {
+    gates.add('verification');
+    riskScore += 2;
+    reasons.push('task explicitly prioritizes long-term stability');
+  }
+  if (hasPattern(text, riskPatterns)) {
+    gates.add('advisor');
+    riskScore += 1;
+    reasons.push('task touches high-risk runtime or memory behavior');
+  }
+  if (text.length > 1200) {
+    gates.add('advisor');
+    riskScore += 2;
+    reasons.push('task context is long or noisy; compress to delta evidence only');
+  }
+  if ((text.match(/\n/g) || []).length > 18) {
+    gates.add('advisor');
+    riskScore += 1;
+  }
+
+  const orderedGates = (['delegation', 'advisor', 'verification'] as WorkflowGate[]).filter((gate) =>
+    gates.has(gate),
+  );
+
+  if (orderedGates.includes('advisor') && orderedGates.includes('verification')) {
+    riskScore += 1;
+  }
+
+  const route = ['plan'];
+  if (orderedGates.includes('delegation')) {
+    route.push('delegate');
+  }
+  if (orderedGates.includes('advisor')) {
+    route.push('advisor');
+  }
+  route.push('implementation');
+  if (orderedGates.includes('verification')) {
+    route.push('verification');
+  }
+
+  const risk: WorkflowRisk = riskScore >= 5 ? 'high' : riskScore >= 3 ? 'medium' : 'low';
+  const normalized = normalizeWorkflowText(text).slice(0, 1200);
+  return {
+    gates: orderedGates,
+    risk,
+    reasons: reasons.filter((value, index) => reasons.indexOf(value) === index).slice(0, 3),
+    route,
+    signature: `${simpleHash(normalized)}:${orderedGates.join(',')}:${risk}`,
+  };
+}
+
+function shouldInjectWorkflowDecision(sessionId: string, decision: WorkflowDecision): boolean {
+  if (decision.gates.length === 0) {
+    workflowSessionStates.delete(sessionId);
+    return false;
+  }
+
+  const prev = workflowSessionStates.get(sessionId);
+  const gateKey = decision.gates.join(',');
+  if (prev && prev.signature === decision.signature && prev.gateKey === gateKey && prev.risk === decision.risk) {
+    return false;
+  }
+
+  if (!prev && workflowSessionStates.size >= MAX_WORKFLOW_SESSION_STATES) {
+    const oldestKey = workflowSessionStates.keys().next().value;
+    if (typeof oldestKey === 'string') {
+      workflowSessionStates.delete(oldestKey);
+    }
+  }
+
+  workflowSessionStates.set(sessionId, {
+    signature: decision.signature,
+    gateKey,
+    risk: decision.risk,
+  });
+  return true;
+}
+
+function renderWorkflowHints(decision: WorkflowDecision): string {
+  if (decision.gates.length === 0) {
+    return '';
+  }
+
+  const requirement =
+    decision.risk === 'high'
+      ? 'required'
+      : decision.risk === 'medium'
+        ? 'recommended'
+        : 'suggested';
+  const lines = ['<openclaw-workflow-gate>'];
+  lines.push(`risk: ${decision.risk}`);
+  lines.push(`gates: ${requirement} -> ${decision.gates.join(', ')}`);
+  if (decision.reasons.length > 0) {
+    lines.push(`why: ${decision.reasons.join('; ')}`);
+  }
+  if (decision.gates.includes('delegation')) {
+    lines.push(
+      '- Run `/delegate <goal>` to write a scoped task spec, then use `openclaw-delegation` to fill it.',
+    );
+  }
+  if (decision.gates.includes('advisor')) {
+    lines.push(
+      '- Run `/advisor <current-plan>` before committing to the current route.',
+    );
+  }
+  if (decision.gates.includes('verification')) {
+    lines.push(
+      '- Run `/verify <target>` before declaring done or ready to release.',
+    );
+  }
+  lines.push(`route: ${decision.route.join(' -> ')}`);
+  lines.push('- Keep gate notes delta-only; do not restate the full session history.');
+  lines.push('</openclaw-workflow-gate>');
+  return lines.join('\n');
+}
+
+function sanitizeTaskId(raw: string): string {
+  const value = raw.trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return value || `TASK-${Date.now()}`;
+}
+
+function makeTaskId(prefix: string): string {
+  const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
+  return `${prefix}-${timestamp}`;
+}
+
+async function writeBlackboardArtifact(
+  taskId: string,
+  fileName: string,
+  content: string,
+): Promise<string> {
+  const dir = path.join(blackboardRoot, sanitizeTaskId(taskId));
+  await fs.mkdir(dir, { recursive: true });
+  const filePath = path.join(dir, fileName);
+  await fs.writeFile(filePath, content, 'utf8');
+  return filePath;
+}
+
+function buildDelegateArtifact(body: string, taskId: string, phase: string): string {
+  return [
+    `task_id: ${taskId}`,
+    `phase: ${phase}`,
+    `purpose: ${body || '<why this child task exists>'}`,
+    'scope:',
+    '- <files/modules/commands/systems>',
+    'known_evidence:',
+    '- <error / observation / line number / link>',
+    'constraints:',
+    '- keep changes scoped',
+    '- do not restate prior chat history',
+    'done_when:',
+    '- <what must be true>',
+    'output:',
+    '- status',
+    '- deliverable',
+    '- evidence',
+    '- assumptions',
+    '- risks',
+    '- next_actions',
+    '',
+    'skill: openclaw-delegation',
+  ].join('\n');
+}
+
+function buildAdvisorArtifact(body: string, taskId: string, stage: string): string {
+  return [
+    `task_id: ${taskId}`,
+    `stage: ${stage}`,
+    `current_plan: ${body || '<what we plan to do>'}`,
+    'known_evidence:',
+    '- <facts / logs / errors / file refs>',
+    'question_for_advisor:',
+    '- What is most likely wrong with this plan?',
+    '- What evidence is missing?',
+    '- What verification should be added?',
+    '- Should we stay on this route?',
+    'required_output:',
+    '- weak assumptions',
+    '- missing evidence',
+    '- regression risks',
+    '- added verification',
+    '- route recommendation',
+    '',
+    'skill: openclaw-advisor-gate',
+  ].join('\n');
+}
+
+function buildVerificationArtifact(body: string, taskId: string): string {
+  return [
+    `task_id: ${taskId}`,
+    `target: ${body || '<what needs independent verification>'}`,
+    'status: pass | partial | fail',
+    'qa_report:',
+    '- verified:',
+    '  - <tests / build / typecheck / happy path>',
+    '- findings:',
+    '  - none',
+    '- blind_spots:',
+    '  - <untested area>',
+    '- release_decision:',
+    '  - <pass / partial / fail and why>',
+    'evidence:',
+    '- <commands / logs / file refs>',
+    'risks:',
+    '- <remaining risk>',
+    'required_fixes:',
+    '- <if any>',
+    'next_actions:',
+    '- <owner and next step>',
+    '',
+    'skill: openclaw-verification-gate',
+  ].join('\n');
+}
+
+async function createWorkflowArtifact(params: {
+  kind: WorkflowArtifactKind;
+  body: string;
+  taskId?: string;
+  phase?: string;
+  stage?: string;
+}): Promise<{ taskId: string; filePath: string }> {
+  const taskId = sanitizeTaskId(
+    params.taskId ||
+      makeTaskId(
+        params.kind === 'delegate'
+          ? 'TASK'
+          : params.kind === 'advisor'
+            ? 'ADVISOR'
+            : 'VERIFY',
+      ),
+  );
+
+  if (params.kind === 'delegate') {
+    const filePath = await writeBlackboardArtifact(
+      taskId,
+      'task-spec.md',
+      buildDelegateArtifact(params.body, taskId, params.phase || 'plan'),
+    );
+    return { taskId, filePath };
+  }
+
+  if (params.kind === 'advisor') {
+    const filePath = await writeBlackboardArtifact(
+      taskId,
+      'advisor-check.md',
+      buildAdvisorArtifact(params.body, taskId, params.stage || 'before-implementation'),
+    );
+    return { taskId, filePath };
+  }
+
+  const filePath = await writeBlackboardArtifact(
+    taskId,
+    'qa-gate.md',
+    buildVerificationArtifact(params.body, taskId),
+  );
+  return { taskId, filePath };
 }
 
 function extractOptions(raw: string): { body: string; flags: Record<string, string | boolean> } {
@@ -290,7 +835,10 @@ function resolveRuntimeConfig(
     autoStart: asBoolean(config.autoStart, true),
     autoInject: asBoolean(config.autoInject, true),
     autoReflect: asBoolean(config.autoReflect, true),
+    autoWorkflowHints: asBoolean(config.autoWorkflowHints, true),
     autoArchive: asBoolean(config.autoArchive, true),
+    archiveAfterDays: asNumber(config.archiveAfterDays, 14),
+    archiveCheckIntervalMinutes: asNumber(config.archiveCheckIntervalMinutes, 360),
     injectTopK: asNumber(config.injectTopK, 8),
     injectThreshold: asNumber(config.injectThreshold, 0.18),
     injectStrategy: normalizeInjectStrategy(config.injectStrategy, 'auto'),
@@ -298,49 +846,23 @@ function resolveRuntimeConfig(
     dbPath: config.dbPath || (ctx ? path.join(ctx.stateDir, 'agent-memory') : path.resolve(__dirname, 'agent_memory')),
     healthCheckInterval: asNumber(config.healthCheckInterval, 60000),
     ttlDays: asNumber(config.ttlDays, 180),
-    archiveAfterDays: asNumber(config.archiveAfterDays, 14),
-    archiveCheckIntervalMinutes: asNumber(config.archiveCheckIntervalMinutes, 360),
     defaultVisibility: normalizeVisibility(config.defaultVisibility, 'project'),
   };
 }
 
-async function maybeRunAutoArchive(
-  runtime: RuntimeConfig,
-  workspaceDir: string | undefined,
-  logger: PluginLogger,
-): Promise<void> {
-  if (!runtime.autoArchive) {
-    return;
-  }
-  const cooldownMs = Math.max(runtime.archiveCheckIntervalMinutes, 5) * 60_000;
-  const now = Date.now();
-  if (lastAutoArchiveAt > 0 && now - lastAutoArchiveAt < cooldownMs) {
-    return;
-  }
-  lastAutoArchiveAt = now;
-  try {
-    const result = await memoryRequest(runtime.serviceUrl, 'POST', '/archive/compact', logger, {
-      days: runtime.archiveAfterDays,
-      workspace_dir: workspaceDir,
-    });
-    if (result?.success && (Number(result.archived_count || 0) > 0 || result.created_archive)) {
-      logger.info(
-        `[local-memory] 自动归档完成 archived=${String(result.archived_count || 0)} created_archive=${String(Boolean(result.created_archive))}`,
-      );
-    }
-  } catch (error) {
-    logger.warn(`[local-memory] 自动归档失败: ${String(error)}`);
-  }
-}
-
 async function startLocalMemory(config: RuntimeConfig, logger: PluginLogger): Promise<boolean> {
-  if (memoryServiceProcess && serviceReady) {
-    return true;
+  if (memoryServiceProcess) {
+    if (serviceReady) {
+      return true;
+    }
+    logger.warn('[local-memory] 检测到未就绪的旧进程，先执行回收');
+    stopLocalMemoryProcess(logger);
   }
 
   const scriptPath = config.scriptPath;
   const cwdPath = path.dirname(scriptPath);
   const port = getPortFromUrl(config.serviceUrl);
+  serviceReady = false;
 
   return new Promise((resolve) => {
     let settled = false;
@@ -402,17 +924,32 @@ async function startLocalMemory(config: RuntimeConfig, logger: PluginLogger): Pr
   });
 }
 
-function stopLocalMemory(logger: PluginLogger): void {
+function clearServiceTimers(): void {
   if (healthCheckTimer) {
     clearInterval(healthCheckTimer);
     healthCheckTimer = null;
   }
+  if (archiveTimer) {
+    clearInterval(archiveTimer);
+    archiveTimer = null;
+  }
+}
+
+function stopLocalMemoryProcess(logger: PluginLogger): void {
   if (memoryServiceProcess) {
     logger.info('[local-memory] 停止记忆服务');
     memoryServiceProcess.kill('SIGTERM');
     memoryServiceProcess = null;
   }
   serviceReady = false;
+}
+
+function stopLocalMemory(logger: PluginLogger): void {
+  clearServiceTimers();
+  healthCheckInFlight = false;
+  archiveSweepInFlight = false;
+  restartInProgress = null;
+  stopLocalMemoryProcess(logger);
 }
 
 async function checkHealth(serviceUrl: string): Promise<boolean> {
@@ -426,30 +963,140 @@ async function checkHealth(serviceUrl: string): Promise<boolean> {
   }
 }
 
-function startHealthCheck(config: RuntimeConfig, logger: PluginLogger): void {
-  if (healthCheckTimer) {
-    clearInterval(healthCheckTimer);
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runArchiveSweep(
+  config: RuntimeConfig,
+  logger: PluginLogger,
+  workspaceDir?: string,
+): Promise<boolean> {
+  const body: Record<string, unknown> = {
+    days: config.archiveAfterDays,
+  };
+  if (workspaceDir) {
+    body.workspace_dir = workspaceDir;
+  } else {
+    body.all_projects = true;
   }
-  healthCheckTimer = setInterval(async () => {
-    const healthy = await checkHealth(config.serviceUrl);
+
+  const result = await memoryRequest(config.serviceUrl, 'POST', '/archive/compact', logger, body);
+  if (!result?.success) {
+    logger.warn('[local-memory] 自动归档扫描失败');
+    return false;
+  }
+
+  const archivedCount = typeof result.archived_count === 'number' ? result.archived_count : 0;
+  if (archivedCount > 0) {
+    const scope = workspaceDir ? `workspace=${workspaceDir}` : 'all-projects';
+    logger.info(`[local-memory] 自动归档完成 (${scope})，归档 ${archivedCount} 条记忆`);
+  }
+  return true;
+}
+
+let healthProbe: (serviceUrl: string) => Promise<boolean> = checkHealth;
+let serviceStartImpl: (config: RuntimeConfig, logger: PluginLogger) => Promise<boolean> =
+  startLocalMemory;
+let sleepImpl: (ms: number) => Promise<void> = sleep;
+let archiveSweepImpl: (
+  config: RuntimeConfig,
+  logger: PluginLogger,
+  workspaceDir?: string,
+) => Promise<boolean> = runArchiveSweep;
+
+async function restartLocalMemory(
+  config: RuntimeConfig,
+  logger: PluginLogger,
+  reason: string,
+): Promise<boolean> {
+  if (restartInProgress) {
+    return restartInProgress;
+  }
+
+  restartInProgress = (async () => {
+    logger.warn(`[local-memory] ${reason}，执行服务重启`);
+    stopLocalMemoryProcess(logger);
+    await sleepImpl(1500);
+    const success = await serviceStartImpl(config, logger);
+    serviceReady = success;
+    if (success) {
+      consecutiveFailures = 0;
+    }
+    return success;
+  })().finally(() => {
+    restartInProgress = null;
+  });
+
+  return restartInProgress;
+}
+
+async function runHealthCheckCycle(config: RuntimeConfig, logger: PluginLogger): Promise<void> {
+  if (healthCheckInFlight || restartInProgress) {
+    return;
+  }
+
+  healthCheckInFlight = true;
+  try {
+    const healthy = await healthProbe(config.serviceUrl);
     if (healthy) {
       consecutiveFailures = 0;
       serviceReady = true;
       return;
     }
 
-    if (!config.autoStart || consecutiveFailures >= MAX_FAILURES) {
+    serviceReady = false;
+    if (!config.autoStart) {
+      logger.warn('[local-memory] 健康检查失败，自动启动已禁用');
+      return;
+    }
+    if (consecutiveFailures >= MAX_FAILURES) {
       logger.warn('[local-memory] 健康检查失败，已停止自动重启');
-      serviceReady = false;
       return;
     }
 
-    logger.warn('[local-memory] 健康检查失败，尝试自动重启');
     consecutiveFailures += 1;
-    stopLocalMemory(logger);
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    await startLocalMemory(config, logger);
+    await restartLocalMemory(config, logger, `健康检查失败，第 ${consecutiveFailures} 次`);
+  } finally {
+    healthCheckInFlight = false;
+  }
+}
+
+function startHealthCheck(config: RuntimeConfig, logger: PluginLogger): void {
+  if (healthCheckTimer) {
+    clearInterval(healthCheckTimer);
+  }
+  healthCheckTimer = setInterval(() => {
+    void runHealthCheckCycle(config, logger);
   }, config.healthCheckInterval);
+}
+
+async function runArchiveCycle(config: RuntimeConfig, logger: PluginLogger): Promise<void> {
+  if (!config.autoArchive || archiveSweepInFlight || restartInProgress) {
+    return;
+  }
+
+  archiveSweepInFlight = true;
+  try {
+    await archiveSweepImpl(config, logger, undefined);
+  } finally {
+    archiveSweepInFlight = false;
+  }
+}
+
+function startArchiveSchedule(config: RuntimeConfig, logger: PluginLogger): void {
+  if (archiveTimer) {
+    clearInterval(archiveTimer);
+    archiveTimer = null;
+  }
+  if (!config.autoArchive) {
+    return;
+  }
+
+  const intervalMs = Math.max(Math.round(config.archiveCheckIntervalMinutes * 60_000), 250);
+  archiveTimer = setInterval(() => {
+    void runArchiveCycle(config, logger);
+  }, intervalMs);
 }
 
 async function memoryRequest(
@@ -485,8 +1132,159 @@ function appendToolEvent(sessionId: string, text: string): void {
   sessionToolEvents.set(sessionId, events.slice(-20));
 }
 
-export default function localMemoryPlugin(api: OpenClawPluginApi): void {
+function buildMemoryVirtualPath(layer: string, memoryId: string): string {
+  return `local-memory/${layer}/${memoryId}.md`;
+}
+
+function storeMemoryVirtualFile(relPath: string, text: string): void {
+  memoryVirtualFiles.set(relPath, { path: relPath, text });
+  if (memoryVirtualFiles.size <= 200) {
+    return;
+  }
+  const oldestKey = memoryVirtualFiles.keys().next().value;
+  if (typeof oldestKey === 'string') {
+    memoryVirtualFiles.delete(oldestKey);
+  }
+}
+
+function sliceVirtualFile(
+  text: string,
+  from?: number,
+  lines?: number,
+): string {
+  const allLines = text.split('\n');
+  const startIndex = Math.max((from ?? 1) - 1, 0);
+  const endIndex = lines && lines > 0
+    ? startIndex + lines
+    : allLines.length;
+  return allLines.slice(startIndex, endIndex).join('\n');
+}
+
+function buildMemorySearchManager(
+  runtime: RuntimeConfig,
+  logger: PluginLogger,
+): MemorySearchManager {
+  return {
+    async search(query, opts) {
+      const result = await memoryRequest(runtime.serviceUrl, 'POST', '/recall', logger, {
+        query,
+        workspace_dir: lastKnownWorkspaceDir,
+        session_key: opts?.sessionKey,
+        top_k: opts?.maxResults ?? Math.max(runtime.injectTopK, 8),
+      });
+
+      if (!result?.success || !Array.isArray(result.results)) {
+        return [];
+      }
+
+      const minScore = typeof opts?.minScore === 'number' ? opts.minScore : runtime.injectThreshold;
+      return (result.results as Array<Record<string, unknown>>)
+        .map((item) => {
+          const score = typeof item.score === 'number' ? item.score : 0;
+          const id = typeof item.id === 'string' ? item.id : '';
+          const layer = typeof item.layer === 'string' ? item.layer : 'project_knowledge';
+          const title = typeof item.title === 'string' ? item.title : 'memory';
+          const summary = typeof item.summary === 'string' ? item.summary : '';
+          const content = typeof item.content === 'string' ? item.content : summary;
+          const snippet = (summary || content).trim();
+          const relPath = buildMemoryVirtualPath(layer, id || title.replace(/\s+/g, '-'));
+          const fileText = [
+            `# ${title}`,
+            '',
+            `layer: ${layer}`,
+            `score: ${score.toFixed(4)}`,
+            '',
+            content || summary,
+          ].join('\n');
+          storeMemoryVirtualFile(relPath, fileText);
+          return {
+            path: relPath,
+            startLine: 1,
+            endLine: fileText.split('\n').length,
+            score,
+            snippet: snippet.slice(0, 300),
+            source: 'memory' as const,
+            citation: `[${layer}] ${title}`,
+          };
+        })
+        .filter((item) => item.score >= minScore);
+    },
+    async readFile(params) {
+      const record = memoryVirtualFiles.get(params.relPath);
+      if (!record) {
+        throw new Error(`memory path not found: ${params.relPath}`);
+      }
+      return {
+        path: record.path,
+        text: sliceVirtualFile(record.text, params.from, params.lines),
+      };
+    },
+    status() {
+      return {
+        backend: 'qmd',
+        provider: 'local-memory',
+        workspaceDir: lastKnownWorkspaceDir,
+        dbPath: runtime.dbPath,
+        vector: {
+          enabled: true,
+          available: serviceReady,
+        },
+        custom: {
+          serviceUrl: runtime.serviceUrl,
+          autoInject: runtime.autoInject,
+          autoReflect: runtime.autoReflect,
+          autoWorkflowHints: runtime.autoWorkflowHints,
+        },
+      };
+    },
+    async sync(params) {
+      params?.progress?.({ completed: 0, total: 1, label: 'archive compact' });
+      await archiveSweepImpl(runtime, logger, lastKnownWorkspaceDir);
+      params?.progress?.({ completed: 1, total: 1, label: 'archive compact' });
+    },
+    async probeEmbeddingAvailability() {
+      const stats = await memoryRequest(runtime.serviceUrl, 'GET', '/stats', logger);
+      const ok = Boolean(stats?.vector_enabled);
+      return {
+        ok,
+        error: ok ? undefined : 'vector search disabled',
+      };
+    },
+    async probeVectorAvailability() {
+      const stats = await memoryRequest(runtime.serviceUrl, 'GET', '/stats', logger);
+      return Boolean(stats?.vector_enabled);
+    },
+    async close() {
+      memoryVirtualFiles.clear();
+    },
+  };
+}
+
+function registerLocalMemoryPlugin(api: OpenClawPluginApi): void {
   const config = (api.pluginConfig || {}) as LocalMemoryConfig;
+
+  if (api.registerMemoryRuntime) {
+    api.registerMemoryRuntime({
+      async getMemorySearchManager() {
+        const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
+        return {
+          manager: buildMemorySearchManager(runtime, api.logger),
+        };
+      },
+      resolveMemoryBackendConfig() {
+        return {
+          backend: 'qmd',
+          qmd: {
+            provider: 'local-memory',
+            serviceUrl: (activeRuntimeConfig || resolveRuntimeConfig(config, null)).serviceUrl,
+          },
+        };
+      },
+      async closeAllMemorySearchManagers() {
+        memoryVirtualFiles.clear();
+      },
+    });
+  }
 
   api.registerService({
     id: 'local-memory-service',
@@ -500,6 +1298,7 @@ export default function localMemoryPlugin(api: OpenClawPluginApi): void {
       const success = await startLocalMemory(runtime, api.logger);
       if (success) {
         startHealthCheck(runtime, api.logger);
+        startArchiveSchedule(runtime, api.logger);
       }
     },
     stop: async () => {
@@ -509,49 +1308,71 @@ export default function localMemoryPlugin(api: OpenClawPluginApi): void {
 
   api.on('before_prompt_build', async (event, ctx) => {
     const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
-    if (!runtime.autoInject || !event.prompt?.trim()) {
+    if (!event.prompt?.trim()) {
       return;
     }
     lastKnownWorkspaceDir = ctx.workspaceDir || lastKnownWorkspaceDir;
-
+    const sections: string[] = [];
+    let prependSystemContext: string | undefined;
     const sessionKey = getSessionIdentifier(ctx);
-    const result = await memoryRequest(runtime.serviceUrl, 'POST', '/context', api.logger, {
-      query: event.prompt,
-      workspace_dir: ctx.workspaceDir,
-      session_key: sessionKey,
-      route: runtime.injectStrategy,
-      top_k: runtime.injectTopK,
-    });
 
-    if (!result?.success || !Array.isArray(result.results)) {
+    if (runtime.autoWorkflowHints) {
+      const decision = inferWorkflowDecision(event.prompt, event.messages);
+      const workflowHints = shouldInjectWorkflowDecision(sessionKey, decision)
+        ? renderWorkflowHints(decision)
+        : '';
+      if (workflowHints) {
+        api.logger.info(
+          `[local-memory] 注入 workflow gate: ${decision.gates.join(',')} risk=${decision.risk}`,
+        );
+        prependSystemContext = WORKFLOW_SYSTEM_POLICY;
+        sections.push(workflowHints);
+      }
+    }
+
+    if (runtime.autoInject) {
+      const result = await memoryRequest(runtime.serviceUrl, 'POST', '/context', api.logger, {
+        query: event.prompt,
+        workspace_dir: ctx.workspaceDir,
+        session_key: sessionKey,
+        route: runtime.injectStrategy,
+        top_k: runtime.injectTopK,
+      });
+
+      if (result?.success && Array.isArray(result.results)) {
+        const eligible = (result.results as Array<Record<string, unknown>>).filter((item) => {
+          const score = typeof item.score === 'number' ? item.score : 0;
+          return score >= runtime.injectThreshold;
+        });
+
+        if (eligible.length > 0) {
+          const content = renderInjectedContext(
+            normalizeInjectStrategy(result.route, runtime.injectStrategy),
+            eligible.map((item) => ({
+              title: typeof item.title === 'string' ? item.title : undefined,
+              layer: typeof item.layer === 'string' ? item.layer : 'project_knowledge',
+              visibility: typeof item.visibility === 'string' ? item.visibility : 'project',
+              score: typeof item.score === 'number' ? item.score : undefined,
+              summary: typeof item.summary === 'string' ? item.summary : undefined,
+              content: typeof item.content === 'string' ? item.content : '',
+            })),
+          );
+
+          api.logger.info(
+            `[local-memory] 注入 ${eligible.length} 条记忆，route=${String(result.route || runtime.injectStrategy)}`,
+          );
+          sections.push(content);
+        }
+      }
+    }
+
+    if (sections.length === 0) {
       return;
     }
 
-    const eligible = (result.results as Array<Record<string, unknown>>).filter((item) => {
-      const score = typeof item.score === 'number' ? item.score : 0;
-      return score >= runtime.injectThreshold;
-    });
-    if (eligible.length === 0) {
-      return;
-    }
-
-    const content = renderInjectedContext(
-      normalizeInjectStrategy(result.route, runtime.injectStrategy),
-      eligible.map((item) => ({
-        title: typeof item.title === 'string' ? item.title : undefined,
-        layer: typeof item.layer === 'string' ? item.layer : 'project_knowledge',
-        visibility: typeof item.visibility === 'string' ? item.visibility : 'project',
-        score: typeof item.score === 'number' ? item.score : undefined,
-        summary: typeof item.summary === 'string' ? item.summary : undefined,
-        content: typeof item.content === 'string' ? item.content : '',
-      })),
-    );
-
-    api.logger.info(
-      `[local-memory] 注入 ${eligible.length} 条记忆，route=${String(result.route || runtime.injectStrategy)}`,
-    );
     return {
-      prependContext: content,
+      prependContext: sections.join('\n\n'),
+      prependSystemContext,
     };
   });
 
@@ -569,20 +1390,98 @@ export default function localMemoryPlugin(api: OpenClawPluginApi): void {
 
   api.on('agent_end', async (event, ctx) => {
     const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
-    if (!runtime.autoReflect || !Array.isArray(event.messages) || event.messages.length === 0) {
-      return;
-    }
     lastKnownWorkspaceDir = ctx.workspaceDir || lastKnownWorkspaceDir;
-
     const sessionKey = getSessionIdentifier(ctx);
-    await memoryRequest(runtime.serviceUrl, 'POST', '/reflect', api.logger, {
-      messages: event.messages,
-      tool_events: sessionToolEvents.get(sessionKey) || [],
-      workspace_dir: ctx.workspaceDir,
-      session_key: sessionKey,
-    });
-    sessionToolEvents.delete(sessionKey);
-    await maybeRunAutoArchive(runtime, ctx.workspaceDir, api.logger);
+    try {
+      if (!runtime.autoReflect || !Array.isArray(event.messages) || event.messages.length === 0) {
+        return;
+      }
+      await memoryRequest(runtime.serviceUrl, 'POST', '/reflect', api.logger, {
+        messages: event.messages,
+        tool_events: sessionToolEvents.get(sessionKey) || [],
+        workspace_dir: ctx.workspaceDir,
+        session_key: sessionKey,
+      });
+    } finally {
+      sessionToolEvents.delete(sessionKey);
+    }
+  });
+
+  api.registerCommand({
+    name: 'delegate',
+    description: '生成 delegation 任务单并落到黑板目录',
+    acceptsArgs: true,
+    handler: async (cmdCtx) => {
+      const raw = cmdCtx.args?.trim();
+      if (!raw) {
+        return '用法: /delegate <任务目标> [--task=TASK-ID] [--phase=plan|build|fix|release]';
+      }
+
+      const { body, flags } = extractOptions(raw);
+      const artifact = await createWorkflowArtifact({
+        kind: 'delegate',
+        body,
+        taskId: typeof flags.task === 'string' ? flags.task : undefined,
+        phase: typeof flags.phase === 'string' ? flags.phase : undefined,
+      });
+      return [
+        '✅ 已生成 delegation 任务单',
+        `任务: ${artifact.taskId}`,
+        `文件: ${artifact.filePath}`,
+        '下一步: 用 openclaw-delegation 补齐 scope / evidence / done_when，再派给子智能体',
+      ].join('\n');
+    },
+  });
+
+  api.registerCommand({
+    name: 'advisor',
+    description: '生成 advisor 二审单并落到黑板目录',
+    acceptsArgs: true,
+    handler: async (cmdCtx) => {
+      const raw = cmdCtx.args?.trim();
+      if (!raw) {
+        return '用法: /advisor <当前计划> [--task=TASK-ID] [--stage=before-implementation|before-release]';
+      }
+
+      const { body, flags } = extractOptions(raw);
+      const artifact = await createWorkflowArtifact({
+        kind: 'advisor',
+        body,
+        taskId: typeof flags.task === 'string' ? flags.task : undefined,
+        stage: typeof flags.stage === 'string' ? flags.stage : undefined,
+      });
+      return [
+        '✅ 已生成 advisor 二审单',
+        `任务: ${artifact.taskId}`,
+        `文件: ${artifact.filePath}`,
+        '下一步: 让 warmaster 或 advisor 视角先打掉弱假设，再继续实现',
+      ].join('\n');
+    },
+  });
+
+  api.registerCommand({
+    name: 'verify',
+    description: '生成 verification / QA gate 单并落到黑板目录',
+    acceptsArgs: true,
+    handler: async (cmdCtx) => {
+      const raw = cmdCtx.args?.trim();
+      if (!raw) {
+        return '用法: /verify <待验证目标> [--task=TASK-ID]';
+      }
+
+      const { body, flags } = extractOptions(raw);
+      const artifact = await createWorkflowArtifact({
+        kind: 'verify',
+        body,
+        taskId: typeof flags.task === 'string' ? flags.task : undefined,
+      });
+      return [
+        '✅ 已生成 verification gate',
+        `任务: ${artifact.taskId}`,
+        `文件: ${artifact.filePath}`,
+        '下一步: 用 openclaw-verification-gate 补齐 findings / blind_spots / release_decision',
+      ].join('\n');
+    },
   });
 
   api.registerCommand({
@@ -788,36 +1687,7 @@ export default function localMemoryPlugin(api: OpenClawPluginApi): void {
       const workspace = lastKnownWorkspaceDir
         ? `?workspace_dir=${encodeURIComponent(lastKnownWorkspaceDir)}`
         : '';
-      return [
-        '🧭 记忆管理面板',
-        `仪表盘: ${runtime.serviceUrl}/dashboard${workspace}`,
-        `统计: ${runtime.serviceUrl}/stats${workspace}`,
-        `健康: ${runtime.serviceUrl}/health`,
-        `自动归档: ${runtime.autoArchive ? '开启' : '关闭'} / ${runtime.archiveAfterDays} 天 / ${runtime.archiveCheckIntervalMinutes} 分钟`,
-      ].join('\n');
-    },
-  });
-
-  api.registerCommand({
-    name: 'mem-panel',
-    description: '打开完整记忆管理入口',
-    handler: async () => {
-      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
-      const workspace = lastKnownWorkspaceDir
-        ? `?workspace_dir=${encodeURIComponent(lastKnownWorkspaceDir)}`
-        : '';
-      return [
-        '🧠 Local Memory Panel',
-        `面板: ${runtime.serviceUrl}/dashboard${workspace}`,
-        `统计: ${runtime.serviceUrl}/stats${workspace}`,
-        `健康: ${runtime.serviceUrl}/health`,
-        '',
-        '常用命令:',
-        '/mem-stats',
-        '/mem-recall <query>',
-        `/mem-archive --days=${runtime.archiveAfterDays}`,
-        '/mem-health',
-      ].join('\n');
+      return `仪表盘地址: ${runtime.serviceUrl}/dashboard${workspace}`;
     },
   });
 
@@ -877,11 +1747,12 @@ export default function localMemoryPlugin(api: OpenClawPluginApi): void {
     handler: async () => {
       const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
       stopLocalMemory(api.logger);
-      await new Promise((resolve) => setTimeout(resolve, 1200));
+      await sleep(1200);
       consecutiveFailures = 0;
       const success = await startLocalMemory(runtime, api.logger);
       if (success) {
         startHealthCheck(runtime, api.logger);
+        startArchiveSchedule(runtime, api.logger);
         return '✅ 记忆服务已重启';
       }
       return '❌ 重启失败';
@@ -903,3 +1774,98 @@ export default function localMemoryPlugin(api: OpenClawPluginApi): void {
 
   api.logger.info('[local-memory] 插件 v3 已加载');
 }
+
+export default {
+  id: 'local-memory',
+  name: 'Local Memory',
+  description:
+    'Layered local memory for OpenClaw with project retention, preferences, workflow gates, slash commands, auto-reflection, archive compaction, cost-aware routing, privacy tiers, and dashboard',
+  kind: 'memory' as const,
+  register: registerLocalMemoryPlugin,
+};
+
+export const __testHooks = {
+  getState() {
+    return {
+      healthCheckActive: Boolean(healthCheckTimer),
+      archiveActive: Boolean(archiveTimer),
+      serviceReady,
+      consecutiveFailures,
+      healthCheckInFlight,
+      archiveSweepInFlight,
+      restartActive: Boolean(restartInProgress),
+    };
+  },
+  resetState() {
+    stopLocalMemory(noopLogger);
+    consecutiveFailures = 0;
+    activeRuntimeConfig = null;
+    lastKnownWorkspaceDir = undefined;
+    sessionToolEvents.clear();
+    workflowSessionStates.clear();
+    memoryVirtualFiles.clear();
+    healthCheckInFlight = false;
+    archiveSweepInFlight = false;
+    restartInProgress = null;
+    blackboardRoot = DEFAULT_BLACKBOARD_ROOT;
+  },
+  setHooks(overrides: {
+    checkHealth?: (serviceUrl: string) => Promise<boolean>;
+    startService?: (config: RuntimeConfig, logger: PluginLogger) => Promise<boolean>;
+    sleep?: (ms: number) => Promise<void>;
+    archiveSweep?: (
+      config: RuntimeConfig,
+      logger: PluginLogger,
+      workspaceDir?: string,
+    ) => Promise<boolean>;
+  }) {
+    if (overrides.checkHealth) {
+      healthProbe = overrides.checkHealth;
+    }
+    if (overrides.startService) {
+      serviceStartImpl = overrides.startService;
+    }
+    if (overrides.sleep) {
+      sleepImpl = overrides.sleep;
+    }
+    if (overrides.archiveSweep) {
+      archiveSweepImpl = overrides.archiveSweep;
+    }
+  },
+  resetHooks() {
+    healthProbe = checkHealth;
+    serviceStartImpl = startLocalMemory;
+    sleepImpl = sleep;
+    archiveSweepImpl = runArchiveSweep;
+  },
+  startHealthCheck(config: RuntimeConfig, logger: PluginLogger = noopLogger) {
+    startHealthCheck(config, logger);
+  },
+  startArchiveSchedule(config: RuntimeConfig, logger: PluginLogger = noopLogger) {
+    startArchiveSchedule(config, logger);
+  },
+  stopAll(logger: PluginLogger = noopLogger) {
+    stopLocalMemory(logger);
+  },
+  inferWorkflowDecision(prompt: string, messages?: unknown[]) {
+    return inferWorkflowDecision(prompt, messages);
+  },
+  shouldInjectWorkflowDecision(sessionId: string, decision: WorkflowDecision) {
+    return shouldInjectWorkflowDecision(sessionId, decision);
+  },
+  async createWorkflowArtifact(params: {
+    kind: WorkflowArtifactKind;
+    body: string;
+    taskId?: string;
+    phase?: string;
+    stage?: string;
+  }) {
+    return createWorkflowArtifact(params);
+  },
+  setBlackboardRoot(root: string) {
+    blackboardRoot = root;
+  },
+  registerPlugin(api: OpenClawPluginApi) {
+    registerLocalMemoryPlugin(api);
+  },
+};

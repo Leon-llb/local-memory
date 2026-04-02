@@ -1,16 +1,15 @@
 {
   "name": "openclaw-local-memory",
-  "version": "3.0.0",
-  "description": "Layered local memory system for OpenClaw with project retention, user preferences, auto-reflection, archive compaction, privacy tiers, and dashboard",
+  "version": "3.2.0",
+  "description": "Layered local memory system for OpenClaw with project retention, workflow gates, slash commands, user preferences, auto-reflection, archive compaction, privacy tiers, and dashboard",
   "main": "index.js",
-  "openclaw": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
   "scripts": {
-    "build": "tsc",
-    "start": "python3 memory_service.py"
+    "build": "npx -y -p typescript@5.9.3 tsc",
+    "start": "python3 memory_service.py",
+    "typecheck": "npx -y -p typescript@5.9.3 tsc --noEmit",
+    "test:node": "npm run build && node --test tests/index.test.cjs",
+    "test:python": "python3 -m unittest discover -s tests -p 'test_*.py'",
+    "test": "npm run typecheck && npm run test:node && npm run test:python"
   },
   "keywords": [
     "openclaw",

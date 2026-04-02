@@ -1,8 +1,9 @@
 {
   "id": "local-memory",
   "name": "Local Memory",
-  "version": "3.0.0",
-  "description": "Layered local memory for OpenClaw with project retention, preferences, auto-reflection, archive compaction, cost-aware routing, privacy tiers, and dashboard",
+  "kind": "memory",
+  "version": "3.2.0",
+  "description": "Layered local memory for OpenClaw with project retention, preferences, workflow gates, slash commands, auto-reflection, archive compaction, cost-aware routing, privacy tiers, and dashboard",
   "author": "Leon",
   "license": "MIT",
   "main": "index.js",
@@ -35,6 +36,10 @@
       "label": "自动沉淀",
       "help": "agent 结束后自动沉淀偏好、项目知识和会话摘要"
     },
+    "autoWorkflowHints": {
+      "label": "工作流闸门提示",
+      "help": "在 before_prompt_build 里按任务类型自动注入去重后的 delegation / advisor / verification gate，并配合 /delegate /advisor /verify"
+    },
     "injectTopK": {
       "label": "召回数量",
       "help": "构建注入上下文时的最大召回条数"
@@ -57,15 +62,15 @@
     },
     "autoArchive": {
       "label": "自动归档",
-      "help": "按周期压缩旧摘要与旧会话片段，沉淀到 archive 层"
+      "help": "按周期检查并自动将老旧记忆压缩归档"
     },
     "archiveAfterDays": {
-      "label": "归档阈值天数",
-      "help": "早于该天数的 summary/session_episode 将进入压缩归档候选"
+      "label": "归档天数",
+      "help": "距离最近访问超过该天数的记忆会进入归档候选"
     },
     "archiveCheckIntervalMinutes": {
-      "label": "归档检查周期",
-      "help": "自动归档的最小触发间隔（分钟）"
+      "label": "归档检查间隔",
+      "help": "自动归档扫描任务的运行间隔（分钟）"
     },
     "healthCheckInterval": {
       "label": "健康检查间隔",
@@ -103,6 +108,10 @@
         "type": "boolean",
         "default": true
       },
+      "autoWorkflowHints": {
+        "type": "boolean",
+        "default": true
+      },
       "injectTopK": {
         "type": "integer",
         "minimum": 1,
@@ -125,16 +134,6 @@
         "enum": ["private", "project", "global"],
         "default": "project"
       },
-      "healthCheckInterval": {
-        "type": "integer",
-        "minimum": 10000,
-        "default": 60000
-      },
-      "ttlDays": {
-        "type": "integer",
-        "minimum": 1,
-        "default": 180
-      },
       "autoArchive": {
         "type": "boolean",
         "default": true
@@ -148,6 +147,16 @@
         "type": "integer",
         "minimum": 5,
         "default": 360
+      },
+      "healthCheckInterval": {
+        "type": "integer",
+        "minimum": 10000,
+        "default": 60000
+      },
+      "ttlDays": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 180
       },
       "scriptPath": {
         "type": "string"

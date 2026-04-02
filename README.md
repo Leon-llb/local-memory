@@ -1,4 +1,4 @@
-# OpenClaw Local Memory v3
+# OpenClaw Local Memory v3.2
 
 为 OpenClaw 设计的本地长期记忆系统。
 
@@ -7,11 +7,12 @@
 - 跨会话项目知识保留
 - 用户偏好持续积累
 - 多层长期记忆
+- delegation / advisor / verification 工作流闸门自动化
 - 成本感知路由
 - 自动沉淀与归档
+- 健康巡检与自动归档稳定性增强
 - 三级隐私
 - 可视化仪表盘
-- 正式插件安装记录
 
 ## 核心变化
 
@@ -63,17 +64,7 @@
 
 另外可通过 `/mem-archive` 对旧摘要做压缩归档。
 
-### 5. 默认归档策略
-
-插件现在支持默认自动归档策略：
-
-- `autoArchive: true`
-- `archiveAfterDays: 14`
-- `archiveCheckIntervalMinutes: 360`
-
-默认会在 `agent_end` 之后按周期检查，把较旧的 `summary / session_episode` 压缩沉淀到 `archive` 层。
-
-### 6. 可视化仪表盘
+### 5. 可视化仪表盘
 
 服务自带本地页面：
 
@@ -88,14 +79,52 @@ http://127.0.0.1:37888/dashboard
 - 注入路由使用情况
 - 最近更新的记忆
 - 项目级记忆分布
-- 健康与统计 API 入口
-- 常用命令与管理入口
+
+### 6. 工作流闸门自动化
+
+插件现在会在 `before_prompt_build` 做保守的任务类型识别，并对高风险任务自动挂 workflow gate。
+
+当用户请求明显涉及以下场景时，会自动注入去重后的 gate 提示，并引导主智能体使用对应命令和 skill：
+
+- `openclaw-delegation`
+  适合派单、拆解、多智能体协作、handoff
+- `openclaw-advisor-gate`
+  适合架构变更、提示词/插件/配置改造、路线切换、长任务收口前二审
+- `openclaw-verification-gate`
+适合 review、QA、回归检查、上线前验证
+
+新增显式命令：
+
+- `/delegate <goal> [--task=TASK-ID] [--phase=plan|build|fix|release]`
+- `/advisor <current-plan> [--task=TASK-ID] [--stage=before-implementation|before-release]`
+- `/verify <target> [--task=TASK-ID]`
+
+这些命令会把产物直接落到黑板目录：
+
+- `task-spec.md`
+- `advisor-check.md`
+- `qa-gate.md`
+
+自动化层默认是保守模式：
+
+- 同一 session、同一 workflow 签名只注入一次，避免反复压缩背景
+- 普通任务只保留轻量提示，不强推 gate
+- 高风险、长链路、发布前任务优先触发 `advisor` 和 `verification`
+
+### 7. 稳定性强化
+
+这版除了 workflow gate 自动化，也补了运行时稳定性：
+
+- 健康巡检带并发闸门，避免重复重启和巡检失明
+- 自动归档改成后台周期任务，支持跨项目归档
+- Python 服务使用线程化 HTTP server，长耗时写入不会阻塞 `/health`
+- 附带 Node 与 Python 回归测试，覆盖 gate 判定、去重、归档和健康检查
 
 ## 架构
 
 ```text
 OpenClaw plugin
-  ├─ before_prompt_build -> POST /context
+  ├─ before_prompt_build -> workflow gate automation + POST /context
   ├─ tool_result_persist -> 缓存工具轨迹
   └─ agent_end -> POST /reflect
 
@@ -153,14 +182,12 @@ bash ./start.sh 37888 180 ./agent_memory
           "autoStart": true,
           "autoInject": true,
           "autoReflect": true,
+          "autoWorkflowHints": true,
           "injectTopK": 8,
           "injectThreshold": 0.18,
           "injectStrategy": "auto",
           "defaultVisibility": "project",
-          "ttlDays": 180,
-          "autoArchive": true,
-          "archiveAfterDays": 14,
-          "archiveCheckIntervalMinutes": 360
+          "ttlDays": 180
         }
       }
     }
@@ -173,10 +200,12 @@ bash ./start.sh 37888 180 ./agent_memory
 - `/mem-ingest <url> [--layer=project_knowledge] [--visibility=project]`
 - `/mem-ingest-text <name>|<text> [--layer=project_knowledge] [--visibility=project]`
 - `/mem-pref <text> [--visibility=global|project]`
+- `/delegate <goal> [--task=TASK-ID] [--phase=plan|build|fix|release]`
+- `/advisor <current-plan> [--task=TASK-ID] [--stage=before-implementation|before-release]`
+- `/verify <target> [--task=TASK-ID]`
 - `/mem-recall <query>`
 - `/mem-stats`
 - `/mem-dashboard`
-- `/mem-panel`
 - `/mem-archive [--days=14]`
 - `/mem-cleanup source=<name>`
 - `/mem-health`
@@ -235,16 +264,6 @@ bash ./start.sh 37888 180 ./agent_memory
 ### 三级隐私良好
 
 支持 `private / project / global` 三档。
-
-### 正式安装记录
-
-仓库现在已补齐 OpenClaw 官方安装元数据，可直接通过以下命令生成 `plugins.installs` 记录：
-
-```bash
-openclaw plugins install --dangerously-force-unsafe-install /path/to/local-memory
-```
-
-`inspect` 中会显示 `Install: Source / Install path / Installed at` 等信息，不再把 `local-memory` 视为无 provenance 的手工插件目录。
 
 ### 可视化仪表盘
 

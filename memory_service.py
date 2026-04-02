@@ -16,10 +16,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from html import escape
 from html.parser import HTMLParser
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -1137,8 +1137,12 @@ class LocalMemoryEngine:
             parts.append("使用工具: " + compact_text(" | ".join(tool_events[-8:]), 260))
         return "\n".join(f"- {item}" for item in parts if item)
 
-    def archive_compact(self, *, workspace_dir: Optional[str], older_than_days: int = 14) -> Dict[str, Any]:
-        project = self.ensure_project(workspace_dir)
+    def _archive_compact_for_project(
+        self,
+        *,
+        project: Dict[str, str],
+        older_than_days: int = 14,
+    ) -> Dict[str, Any]:
         cutoff = (datetime.now() - timedelta(days=older_than_days)).isoformat(timespec="seconds")
         with self.lock:
             rows = self.db.execute(
@@ -1204,6 +1208,61 @@ class LocalMemoryEngine:
             "archived_count": len(ids),
             "created_archive": bool(archive_result.get("stored")),
             "archive_id": archive_result.get("id"),
+        }
+
+    def archive_compact(
+        self,
+        *,
+        workspace_dir: Optional[str],
+        older_than_days: int = 14,
+        all_projects: bool = False,
+    ) -> Dict[str, Any]:
+        if not all_projects:
+            project = self.ensure_project(workspace_dir)
+            return self._archive_compact_for_project(
+                project=project,
+                older_than_days=older_than_days,
+            )
+
+        with self.lock:
+            project_rows = self.db.execute(
+                """
+                SELECT id, workspace_path, project_name
+                FROM projects
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+
+        project_payloads = [
+            {
+                "id": row["id"],
+                "workspace_path": row["workspace_path"],
+                "project_name": row["project_name"],
+            }
+            for row in project_rows
+        ]
+
+        results = []
+        total_archived = 0
+        total_created = 0
+        for project in project_payloads:
+            result = self._archive_compact_for_project(
+                project=project,
+                older_than_days=older_than_days,
+            )
+            archived_count = int(result.get("archived_count", 0))
+            total_archived += archived_count
+            total_created += int(bool(result.get("created_archive")))
+            if archived_count > 0 or result.get("created_archive"):
+                results.append(result)
+
+        return {
+            "success": True,
+            "scope": "all_projects",
+            "project_count": len(project_payloads),
+            "archived_count": total_archived,
+            "created_archives": total_created,
+            "projects": results,
         }
 
     def cleanup(
@@ -1558,33 +1617,6 @@ class LocalMemoryEngine:
       font-size: 12px;
       margin-top: 12px;
     }}
-    .pill-row {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 12px;
-    }}
-    .pill {{
-      display: inline-flex;
-      align-items: center;
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 999px;
-      padding: 8px 12px;
-      color: var(--text);
-      text-decoration: none;
-      background: rgba(255,255,255,0.03);
-    }}
-    .pill:hover {{
-      background: rgba(112,197,141,0.14);
-    }}
-    .cmd-list {{
-      margin: 0;
-      padding-left: 18px;
-      color: var(--muted);
-    }}
-    .cmd-list li {{
-      margin-bottom: 8px;
-    }}
     @media (max-width: 860px) {{
       .hero, .grid {{
         grid-template-columns: 1fr;
@@ -1623,39 +1655,12 @@ class LocalMemoryEngine:
       <section class="card">
         <h2>Route Usage</h2>
         {bar_rows(route_usage, '注入路由分布')}
-        <div class="pill-row">
-          <a class="pill" href="/health" target="_blank" rel="noreferrer">Health API</a>
-          <a class="pill" href="/stats{('?workspace_dir=' + quote(workspace_dir, safe='')) if workspace_dir else ''}" target="_blank" rel="noreferrer">Stats API</a>
-          <a class="pill" href="/dashboard" target="_blank" rel="noreferrer">Global View</a>
-        </div>
       </section>
     </div>
 
     <div class="grid">
       <section class="card">{bar_rows(layers, '记忆层分布')}</section>
       <section class="card">{bar_rows(visibilities, '隐私层级分布')}</section>
-    </div>
-
-    <div class="grid">
-      <section class="card">
-        <h2>Management</h2>
-        <div>推荐入口：<code>/mem-panel</code> 与 <code>/mem-dashboard</code></div>
-        <div class="pill-row">
-          <a class="pill" href="/dashboard{('?workspace_dir=' + quote(workspace_dir, safe='')) if workspace_dir else ''}" target="_blank" rel="noreferrer">当前项目面板</a>
-          <a class="pill" href="/stats{('?workspace_dir=' + quote(workspace_dir, safe='')) if workspace_dir else ''}" target="_blank" rel="noreferrer">当前项目统计</a>
-          <a class="pill" href="/health" target="_blank" rel="noreferrer">服务健康</a>
-        </div>
-        <div class="foot">自动归档由 OpenClaw 插件侧定时触发，压缩旧的 summary / session_episode 到 archive 层。</div>
-      </section>
-      <section class="card">
-        <h2>Commands</h2>
-        <ul class="cmd-list">
-          <li><code>/mem-stats</code> 查看层级、隐私、路由统计</li>
-          <li><code>/mem-recall &lt;query&gt;</code> 检索当前项目记忆</li>
-          <li><code>/mem-archive --days=14</code> 手动触发归档压缩</li>
-          <li><code>/mem-health</code> 与 <code>/mem-restart</code> 做服务巡检</li>
-        </ul>
-      </section>
     </div>
 
     <div class="grid">
@@ -1697,14 +1702,20 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+        try:
+            self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError):
+            Logger.log("响应写入时连接已断开", "debug")
 
     def _send_html(self, html: str, status: int = 200) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(html.encode("utf-8"))
+        try:
+            self.wfile.write(html.encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError):
+            Logger.log("响应写入时连接已断开", "debug")
 
     def _read_body(self) -> Dict[str, Any]:
         try:
@@ -1849,6 +1860,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             result = engine.archive_compact(
                 workspace_dir=body.get("workspace_dir"),
                 older_than_days=int(body.get("days", 14)),
+                all_projects=bool(body.get("all_projects", False)),
             )
             self._send_json(result)
             return
@@ -1880,6 +1892,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._send_json({"success": False, "error": "Not found"}, 404)
 
 
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=f"OpenClaw Local Memory Service v{VERSION}")
     parser.add_argument("--port", type=int, default=37888, help="服务端口")
@@ -1890,7 +1907,7 @@ def main() -> None:
     global engine
     engine = LocalMemoryEngine(db_path=args.db_path, ttl_days=args.ttl_days)
 
-    server = HTTPServer(("127.0.0.1", args.port), RequestHandler)
+    server = ReusableThreadingHTTPServer(("127.0.0.1", args.port), RequestHandler)
     Logger.log(f"服务启动: http://127.0.0.1:{args.port}", "success")
     Logger.log(f"GET  /health")
     Logger.log(f"GET  /stats")
