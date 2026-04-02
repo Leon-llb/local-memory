@@ -119,6 +119,7 @@ interface LocalMemoryConfig {
   autoStart?: boolean;
   autoInject?: boolean;
   autoReflect?: boolean;
+  autoArchive?: boolean;
   injectTopK?: number;
   injectThreshold?: number;
   injectStrategy?: InjectStrategy;
@@ -126,6 +127,8 @@ interface LocalMemoryConfig {
   dbPath?: string;
   healthCheckInterval?: number;
   ttlDays?: number;
+  archiveAfterDays?: number;
+  archiveCheckIntervalMinutes?: number;
   defaultVisibility?: Visibility;
 }
 
@@ -134,6 +137,7 @@ interface RuntimeConfig {
   autoStart: boolean;
   autoInject: boolean;
   autoReflect: boolean;
+  autoArchive: boolean;
   injectTopK: number;
   injectThreshold: number;
   injectStrategy: InjectStrategy;
@@ -141,6 +145,8 @@ interface RuntimeConfig {
   dbPath: string;
   healthCheckInterval: number;
   ttlDays: number;
+  archiveAfterDays: number;
+  archiveCheckIntervalMinutes: number;
   defaultVisibility: Visibility;
 }
 
@@ -150,6 +156,7 @@ let healthCheckTimer: ReturnType<typeof setInterval> | null = null;
 let consecutiveFailures = 0;
 let activeRuntimeConfig: RuntimeConfig | null = null;
 let lastKnownWorkspaceDir: string | undefined;
+let lastAutoArchiveAt = 0;
 const MAX_FAILURES = 3;
 const sessionToolEvents = new Map<string, string[]>();
 
@@ -283,6 +290,7 @@ function resolveRuntimeConfig(
     autoStart: asBoolean(config.autoStart, true),
     autoInject: asBoolean(config.autoInject, true),
     autoReflect: asBoolean(config.autoReflect, true),
+    autoArchive: asBoolean(config.autoArchive, true),
     injectTopK: asNumber(config.injectTopK, 8),
     injectThreshold: asNumber(config.injectThreshold, 0.18),
     injectStrategy: normalizeInjectStrategy(config.injectStrategy, 'auto'),
@@ -290,8 +298,39 @@ function resolveRuntimeConfig(
     dbPath: config.dbPath || (ctx ? path.join(ctx.stateDir, 'agent-memory') : path.resolve(__dirname, 'agent_memory')),
     healthCheckInterval: asNumber(config.healthCheckInterval, 60000),
     ttlDays: asNumber(config.ttlDays, 180),
+    archiveAfterDays: asNumber(config.archiveAfterDays, 14),
+    archiveCheckIntervalMinutes: asNumber(config.archiveCheckIntervalMinutes, 360),
     defaultVisibility: normalizeVisibility(config.defaultVisibility, 'project'),
   };
+}
+
+async function maybeRunAutoArchive(
+  runtime: RuntimeConfig,
+  workspaceDir: string | undefined,
+  logger: PluginLogger,
+): Promise<void> {
+  if (!runtime.autoArchive) {
+    return;
+  }
+  const cooldownMs = Math.max(runtime.archiveCheckIntervalMinutes, 5) * 60_000;
+  const now = Date.now();
+  if (lastAutoArchiveAt > 0 && now - lastAutoArchiveAt < cooldownMs) {
+    return;
+  }
+  lastAutoArchiveAt = now;
+  try {
+    const result = await memoryRequest(runtime.serviceUrl, 'POST', '/archive/compact', logger, {
+      days: runtime.archiveAfterDays,
+      workspace_dir: workspaceDir,
+    });
+    if (result?.success && (Number(result.archived_count || 0) > 0 || result.created_archive)) {
+      logger.info(
+        `[local-memory] 自动归档完成 archived=${String(result.archived_count || 0)} created_archive=${String(Boolean(result.created_archive))}`,
+      );
+    }
+  } catch (error) {
+    logger.warn(`[local-memory] 自动归档失败: ${String(error)}`);
+  }
 }
 
 async function startLocalMemory(config: RuntimeConfig, logger: PluginLogger): Promise<boolean> {
@@ -543,6 +582,7 @@ export default function localMemoryPlugin(api: OpenClawPluginApi): void {
       session_key: sessionKey,
     });
     sessionToolEvents.delete(sessionKey);
+    await maybeRunAutoArchive(runtime, ctx.workspaceDir, api.logger);
   });
 
   api.registerCommand({
@@ -748,7 +788,36 @@ export default function localMemoryPlugin(api: OpenClawPluginApi): void {
       const workspace = lastKnownWorkspaceDir
         ? `?workspace_dir=${encodeURIComponent(lastKnownWorkspaceDir)}`
         : '';
-      return `仪表盘地址: ${runtime.serviceUrl}/dashboard${workspace}`;
+      return [
+        '🧭 记忆管理面板',
+        `仪表盘: ${runtime.serviceUrl}/dashboard${workspace}`,
+        `统计: ${runtime.serviceUrl}/stats${workspace}`,
+        `健康: ${runtime.serviceUrl}/health`,
+        `自动归档: ${runtime.autoArchive ? '开启' : '关闭'} / ${runtime.archiveAfterDays} 天 / ${runtime.archiveCheckIntervalMinutes} 分钟`,
+      ].join('\n');
+    },
+  });
+
+  api.registerCommand({
+    name: 'mem-panel',
+    description: '打开完整记忆管理入口',
+    handler: async () => {
+      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
+      const workspace = lastKnownWorkspaceDir
+        ? `?workspace_dir=${encodeURIComponent(lastKnownWorkspaceDir)}`
+        : '';
+      return [
+        '🧠 Local Memory Panel',
+        `面板: ${runtime.serviceUrl}/dashboard${workspace}`,
+        `统计: ${runtime.serviceUrl}/stats${workspace}`,
+        `健康: ${runtime.serviceUrl}/health`,
+        '',
+        '常用命令:',
+        '/mem-stats',
+        '/mem-recall <query>',
+        `/mem-archive --days=${runtime.archiveAfterDays}`,
+        '/mem-health',
+      ].join('\n');
     },
   });
 

@@ -19,7 +19,7 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -1558,6 +1558,33 @@ class LocalMemoryEngine:
       font-size: 12px;
       margin-top: 12px;
     }}
+    .pill-row {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }}
+    .pill {{
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 999px;
+      padding: 8px 12px;
+      color: var(--text);
+      text-decoration: none;
+      background: rgba(255,255,255,0.03);
+    }}
+    .pill:hover {{
+      background: rgba(112,197,141,0.14);
+    }}
+    .cmd-list {{
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }}
+    .cmd-list li {{
+      margin-bottom: 8px;
+    }}
     @media (max-width: 860px) {{
       .hero, .grid {{
         grid-template-columns: 1fr;
@@ -1596,12 +1623,39 @@ class LocalMemoryEngine:
       <section class="card">
         <h2>Route Usage</h2>
         {bar_rows(route_usage, '注入路由分布')}
+        <div class="pill-row">
+          <a class="pill" href="/health" target="_blank" rel="noreferrer">Health API</a>
+          <a class="pill" href="/stats{('?workspace_dir=' + quote(workspace_dir, safe='')) if workspace_dir else ''}" target="_blank" rel="noreferrer">Stats API</a>
+          <a class="pill" href="/dashboard" target="_blank" rel="noreferrer">Global View</a>
+        </div>
       </section>
     </div>
 
     <div class="grid">
       <section class="card">{bar_rows(layers, '记忆层分布')}</section>
       <section class="card">{bar_rows(visibilities, '隐私层级分布')}</section>
+    </div>
+
+    <div class="grid">
+      <section class="card">
+        <h2>Management</h2>
+        <div>推荐入口：<code>/mem-panel</code> 与 <code>/mem-dashboard</code></div>
+        <div class="pill-row">
+          <a class="pill" href="/dashboard{('?workspace_dir=' + quote(workspace_dir, safe='')) if workspace_dir else ''}" target="_blank" rel="noreferrer">当前项目面板</a>
+          <a class="pill" href="/stats{('?workspace_dir=' + quote(workspace_dir, safe='')) if workspace_dir else ''}" target="_blank" rel="noreferrer">当前项目统计</a>
+          <a class="pill" href="/health" target="_blank" rel="noreferrer">服务健康</a>
+        </div>
+        <div class="foot">自动归档由 OpenClaw 插件侧定时触发，压缩旧的 summary / session_episode 到 archive 层。</div>
+      </section>
+      <section class="card">
+        <h2>Commands</h2>
+        <ul class="cmd-list">
+          <li><code>/mem-stats</code> 查看层级、隐私、路由统计</li>
+          <li><code>/mem-recall &lt;query&gt;</code> 检索当前项目记忆</li>
+          <li><code>/mem-archive --days=14</code> 手动触发归档压缩</li>
+          <li><code>/mem-health</code> 与 <code>/mem-restart</code> 做服务巡检</li>
+        </ul>
+      </section>
     </div>
 
     <div class="grid">

@@ -3,6 +3,11 @@
   "version": "3.0.0",
   "description": "Layered local memory system for OpenClaw with project retention, user preferences, auto-reflection, archive compaction, privacy tiers, and dashboard",
   "main": "index.js",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "scripts": {
     "build": "tsc",
     "start": "python3 memory_service.py"
@@ -20,7 +25,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-username/openclaw-local-memory.git"
+    "url": "https://github.com/Leon-llb/local-memory.git"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

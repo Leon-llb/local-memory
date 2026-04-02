@@ -11,6 +11,7 @@
 - 自动沉淀与归档
 - 三级隐私
 - 可视化仪表盘
+- 正式插件安装记录
 
 ## 核心变化
 
@@ -62,7 +63,17 @@
 
 另外可通过 `/mem-archive` 对旧摘要做压缩归档。
 
-### 5. 可视化仪表盘
+### 5. 默认归档策略
+
+插件现在支持默认自动归档策略：
+
+- `autoArchive: true`
+- `archiveAfterDays: 14`
+- `archiveCheckIntervalMinutes: 360`
+
+默认会在 `agent_end` 之后按周期检查，把较旧的 `summary / session_episode` 压缩沉淀到 `archive` 层。
+
+### 6. 可视化仪表盘
 
 服务自带本地页面：
 
@@ -77,6 +88,8 @@ http://127.0.0.1:37888/dashboard
 - 注入路由使用情况
 - 最近更新的记忆
 - 项目级记忆分布
+- 健康与统计 API 入口
+- 常用命令与管理入口
 
 ## 架构
 
@@ -144,7 +157,10 @@ bash ./start.sh 37888 180 ./agent_memory
           "injectThreshold": 0.18,
           "injectStrategy": "auto",
           "defaultVisibility": "project",
-          "ttlDays": 180
+          "ttlDays": 180,
+          "autoArchive": true,
+          "archiveAfterDays": 14,
+          "archiveCheckIntervalMinutes": 360
         }
       }
     }
@@ -160,6 +176,7 @@ bash ./start.sh 37888 180 ./agent_memory
 - `/mem-recall <query>`
 - `/mem-stats`
 - `/mem-dashboard`
+- `/mem-panel`
 - `/mem-archive [--days=14]`
 - `/mem-cleanup source=<name>`
 - `/mem-health`
@@ -218,6 +235,16 @@ bash ./start.sh 37888 180 ./agent_memory
 ### 三级隐私良好
 
 支持 `private / project / global` 三档。
+
+### 正式安装记录
+
+仓库现在已补齐 OpenClaw 官方安装元数据，可直接通过以下命令生成 `plugins.installs` 记录：
+
+```bash
+openclaw plugins install --dangerously-force-unsafe-install /path/to/local-memory
+```
+
+`inspect` 中会显示 `Install: Source / Install path / Installed at` 等信息，不再把 `local-memory` 视为无 provenance 的手工插件目录。
 
 ### 可视化仪表盘
 

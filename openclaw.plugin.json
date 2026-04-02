@@ -8,7 +8,7 @@
   "main": "index.js",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-username/openclaw-local-memory"
+    "url": "https://github.com/Leon-llb/local-memory"
   },
   "keywords": [
     "memory",
@@ -54,6 +54,18 @@
     "ttlDays": {
       "label": "默认 TTL",
       "help": "会话型记忆默认过期天数"
+    },
+    "autoArchive": {
+      "label": "自动归档",
+      "help": "按周期压缩旧摘要与旧会话片段，沉淀到 archive 层"
+    },
+    "archiveAfterDays": {
+      "label": "归档阈值天数",
+      "help": "早于该天数的 summary/session_episode 将进入压缩归档候选"
+    },
+    "archiveCheckIntervalMinutes": {
+      "label": "归档检查周期",
+      "help": "自动归档的最小触发间隔（分钟）"
     },
     "healthCheckInterval": {
       "label": "健康检查间隔",
@@ -122,6 +134,20 @@
         "type": "integer",
         "minimum": 1,
         "default": 180
+      },
+      "autoArchive": {
+        "type": "boolean",
+        "default": true
+      },
+      "archiveAfterDays": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 14
+      },
+      "archiveCheckIntervalMinutes": {
+        "type": "integer",
+        "minimum": 5,
+        "default": 360
       },
       "scriptPath": {
         "type": "string"
