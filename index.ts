@@ -1,32 +1,17 @@
 /**
- * OpenClaw LocalMemory 插件 v2
+ * OpenClaw Local Memory 插件 v3
  *
- * 改进版: 健康检查 + 自动重启 + 清理命令 + Re-rank
- *
- * 配置示例:
- * {
- *   "plugins": {
- *     "local-memory": {
- *       "enabled": true,
- *       "config": {
- *         "serviceUrl": "http://127.0.0.1:37888",
- *         "autoStart": true,
- *         "autoInject": true,
- *         "injectTopK": 3,
- *         "injectThreshold": 0.5,
- *         "healthCheckInterval": 60000,
- *         "ttlDays": 90
- *       }
- *     }
- *   }
- * }
+ * 设计目标：
+ * 1. 跨会话项目知识保留
+ * 2. 用户偏好持续积累
+ * 3. 分层长期记忆 + agent_end 自动沉淀
+ * 4. 成本感知注入策略
+ * 5. 三级隐私（private / project / global）
+ * 6. 可视化仪表盘
  */
 
 import { spawn, ChildProcess } from 'child_process';
-
-// ============================================================================
-// 类型定义
-// ============================================================================
+import path from 'path';
 
 interface PluginLogger {
   debug?: (message: string) => void;
@@ -55,6 +40,18 @@ type PluginCommandResult = string | { text: string } | { text: string; format?: 
 
 interface BeforeAgentStartEvent {
   prompt?: string;
+}
+
+interface BeforePromptBuildEvent {
+  prompt?: string;
+  messages?: unknown[];
+}
+
+interface BeforePromptBuildResult {
+  prependContext?: string;
+  systemPrompt?: string;
+  prependSystemContext?: string;
+  appendSystemContext?: string;
 }
 
 interface ToolResultPersistEvent {
@@ -98,122 +95,291 @@ interface OpenClawPluginApi {
     requireAuth?: boolean;
     handler: (ctx: PluginCommandContext) => PluginCommandResult | Promise<PluginCommandResult>;
   }) => void;
-  on: ((event: "before_agent_start", callback: (event: BeforeAgentStartEvent, ctx: EventContext) => void | Promise<void>) => void) &
-      ((event: "tool_result_persist", callback: (event: ToolResultPersistEvent, ctx: EventContext) => void | Promise<void>) => void) &
-      ((event: "agent_end", callback: (event: AgentEndEvent, ctx: EventContext) => void | Promise<void>) => void);
+  on: ((event: 'before_prompt_build', callback: (event: BeforePromptBuildEvent, ctx: EventContext) =>
+    | void
+    | BeforePromptBuildResult
+    | Promise<void | BeforePromptBuildResult>) => void) &
+      ((event: 'before_agent_start', callback: (event: BeforeAgentStartEvent, ctx: EventContext) => void | Promise<void>) => void) &
+      ((event: 'tool_result_persist', callback: (event: ToolResultPersistEvent, ctx: EventContext) => void | Promise<void>) => void) &
+      ((event: 'agent_end', callback: (event: AgentEndEvent, ctx: EventContext) => void | Promise<void>) => void);
   injectContext?: (ctx: EventContext, content: string) => Promise<void>;
 }
 
-// ============================================================================
-// 配置类型
-// ============================================================================
+type InjectStrategy = 'auto' | 'lean' | 'balanced' | 'deep';
+type Visibility = 'private' | 'project' | 'global';
+type MemoryLayer =
+  | 'user_preference'
+  | 'project_knowledge'
+  | 'summary'
+  | 'session_episode'
+  | 'archive';
 
 interface LocalMemoryConfig {
   serviceUrl?: string;
   autoStart?: boolean;
   autoInject?: boolean;
+  autoReflect?: boolean;
   injectTopK?: number;
   injectThreshold?: number;
+  injectStrategy?: InjectStrategy;
   scriptPath?: string;
-  healthCheckInterval?: number;  // 健康检查间隔 (ms)
-  ttlDays?: number;              // Python 端 TTL
+  dbPath?: string;
+  healthCheckInterval?: number;
+  ttlDays?: number;
+  defaultVisibility?: Visibility;
 }
 
-// ============================================================================
-// Python 服务进程管理 (改进版)
-// ============================================================================
+interface RuntimeConfig {
+  serviceUrl: string;
+  autoStart: boolean;
+  autoInject: boolean;
+  autoReflect: boolean;
+  injectTopK: number;
+  injectThreshold: number;
+  injectStrategy: InjectStrategy;
+  scriptPath: string;
+  dbPath: string;
+  healthCheckInterval: number;
+  ttlDays: number;
+  defaultVisibility: Visibility;
+}
 
 let memoryServiceProcess: ChildProcess | null = null;
 let serviceReady = false;
 let healthCheckTimer: ReturnType<typeof setInterval> | null = null;
 let consecutiveFailures = 0;
+let activeRuntimeConfig: RuntimeConfig | null = null;
+let lastKnownWorkspaceDir: string | undefined;
 const MAX_FAILURES = 3;
+const sessionToolEvents = new Map<string, string[]>();
 
-function startLocalMemory(config: LocalMemoryConfig, logger: PluginLogger): Promise<boolean> {
+function asBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function asNumber(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function normalizeVisibility(value: unknown, fallback: Visibility): Visibility {
+  return value === 'private' || value === 'project' || value === 'global' ? value : fallback;
+}
+
+function normalizeLayer(value: unknown, fallback: MemoryLayer): MemoryLayer {
+  const allowed = new Set<MemoryLayer>([
+    'user_preference',
+    'project_knowledge',
+    'summary',
+    'session_episode',
+    'archive',
+  ]);
+  return typeof value === 'string' && allowed.has(value as MemoryLayer)
+    ? (value as MemoryLayer)
+    : fallback;
+}
+
+function normalizeInjectStrategy(value: unknown, fallback: InjectStrategy): InjectStrategy {
+  return value === 'auto' || value === 'lean' || value === 'balanced' || value === 'deep'
+    ? value
+    : fallback;
+}
+
+function flattenMessageContent(
+  content: string | Array<{ type: string; text?: string }> | undefined,
+): string {
+  if (!content) {
+    return '';
+  }
+  if (typeof content === 'string') {
+    return content;
+  }
+  return content
+    .filter((item) => item.type === 'text' && typeof item.text === 'string')
+    .map((item) => item.text?.trim() ?? '')
+    .filter(Boolean)
+    .join('\n');
+}
+
+function getSessionIdentifier(ctx: EventContext): string {
+  return ctx.sessionKey || ctx.agentId || 'default-session';
+}
+
+function extractOptions(raw: string): { body: string; flags: Record<string, string | boolean> } {
+  const flags: Record<string, string | boolean> = {};
+  const body = raw.replace(/--([\w-]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\s]+)))?/g, (_, key: string, a: string, b: string, c: string) => {
+    flags[key] = a ?? b ?? c ?? true;
+    return '';
+  }).trim();
+  return { body, flags };
+}
+
+function getPortFromUrl(serviceUrl: string): string {
+  try {
+    const parsed = new URL(serviceUrl);
+    return parsed.port || '37888';
+  } catch {
+    return '37888';
+  }
+}
+
+function resolveWorkspaceFromCommand(cmdCtx: PluginCommandContext): string | undefined {
+  const maybeConfig = cmdCtx.config as Record<string, unknown>;
+  const candidate = maybeConfig.workspaceDir || maybeConfig.cwd || lastKnownWorkspaceDir;
+  return typeof candidate === 'string' ? candidate : undefined;
+}
+
+function renderInjectedContext(
+  route: InjectStrategy,
+  memories: Array<{
+    title?: string;
+    layer: string;
+    visibility: string;
+    score?: number;
+    summary?: string;
+    content: string;
+  }>,
+): string {
+  const labels: Record<string, string> = {
+    user_preference: '用户偏好',
+    project_knowledge: '项目长期知识',
+    summary: '沉淀摘要',
+    session_episode: '近期会话片段',
+    archive: '归档洞察',
+  };
+
+  const groups = new Map<string, string[]>();
+  for (const memory of memories) {
+    const layer = memory.layer || 'project_knowledge';
+    const title = memory.title ? `${memory.title}: ` : '';
+    const payload = memory.summary || memory.content;
+    const line = `- ${title}${payload}`.trim();
+    const items = groups.get(layer) || [];
+    items.push(line);
+    groups.set(layer, items);
+  }
+
+  const sections = [`<local-memory route="${route}">`];
+  for (const layer of ['user_preference', 'project_knowledge', 'summary', 'session_episode', 'archive']) {
+    const items = groups.get(layer);
+    if (!items || items.length === 0) {
+      continue;
+    }
+    sections.push(`### ${labels[layer] || layer}`);
+    sections.push(...items);
+    sections.push('');
+  }
+  sections.push('</local-memory>');
+  return sections.join('\n').trim();
+}
+
+function resolveRuntimeConfig(
+  config: LocalMemoryConfig,
+  ctx: PluginServiceContext | null,
+): RuntimeConfig {
+  const scriptPath = config.scriptPath || path.resolve(__dirname, 'start.sh');
+  const serviceUrl = config.serviceUrl || 'http://127.0.0.1:37888';
+  return {
+    serviceUrl,
+    autoStart: asBoolean(config.autoStart, true),
+    autoInject: asBoolean(config.autoInject, true),
+    autoReflect: asBoolean(config.autoReflect, true),
+    injectTopK: asNumber(config.injectTopK, 8),
+    injectThreshold: asNumber(config.injectThreshold, 0.18),
+    injectStrategy: normalizeInjectStrategy(config.injectStrategy, 'auto'),
+    scriptPath,
+    dbPath: config.dbPath || (ctx ? path.join(ctx.stateDir, 'agent-memory') : path.resolve(__dirname, 'agent_memory')),
+    healthCheckInterval: asNumber(config.healthCheckInterval, 60000),
+    ttlDays: asNumber(config.ttlDays, 180),
+    defaultVisibility: normalizeVisibility(config.defaultVisibility, 'project'),
+  };
+}
+
+async function startLocalMemory(config: RuntimeConfig, logger: PluginLogger): Promise<boolean> {
+  if (memoryServiceProcess && serviceReady) {
+    return true;
+  }
+
+  const scriptPath = config.scriptPath;
+  const cwdPath = path.dirname(scriptPath);
+  const port = getPortFromUrl(config.serviceUrl);
+
   return new Promise((resolve) => {
-    const scriptPath = config.scriptPath || '/Users/leon/openclaw-local-memory/start.sh';
-    const cwdPath = scriptPath.replace('/start.sh', '');
+    let settled = false;
+    const settle = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
 
-    logger.info(`[local-memory] 🧠 正在启动 Python 记忆服务 v2...`);
-
-    memoryServiceProcess = spawn('bash', [scriptPath], {
+    logger.info(`[local-memory] 启动记忆服务: ${scriptPath}`);
+    memoryServiceProcess = spawn('bash', [scriptPath, port, String(config.ttlDays), config.dbPath], {
       cwd: cwdPath,
       detached: false,
-      env: { ...process.env, PYTHONUNBUFFERED: '1' }
+      env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });
 
     memoryServiceProcess.stdout?.on('data', (data) => {
       const output = data.toString().trim();
+      if (!output) return;
       if (output.includes('服务启动:')) {
         serviceReady = true;
         consecutiveFailures = 0;
-        logger.info(`[local-memory] ✅ Python 服务已就绪`);
-        resolve(true);
+        logger.info('[local-memory] 服务已就绪');
+        settle(true);
       }
-      logger.info(`[记忆服务]: ${output}`);
+      logger.info(`[记忆服务] ${output}`);
     });
 
     memoryServiceProcess.stderr?.on('data', (data) => {
       const output = data.toString().trim();
-      if (output.includes('Warning') || output.includes('Deprecation')) {
-        logger.warn(`[记忆服务-警告]: ${output}`);
-      } else {
-        logger.error(`[记忆服务-错误]: ${output}`);
-      }
+      if (!output) return;
+      logger.warn(`[记忆服务] ${output}`);
     });
 
     memoryServiceProcess.on('error', (err) => {
-      logger.error(`[local-memory] ❌ 启动失败: ${err.message}`);
-      resolve(false);
+      serviceReady = false;
+      logger.error(`[local-memory] 启动失败: ${err.message}`);
+      settle(false);
     });
 
     memoryServiceProcess.on('exit', (code, signal) => {
       serviceReady = false;
       memoryServiceProcess = null;
-
       if (signal) {
-        logger.info(`[local-memory] 💤 Python 服务已停止 (信号: ${signal})`);
-      } else if (code !== 0) {
-        logger.warn(`[local-memory] ⚠️ Python 服务异常退出 (code: ${code})`);
-        // 异常退出时考虑自动重启
-        if (consecutiveFailures < MAX_FAILURES) {
-          logger.info(`[local-memory] 🔄 尝试自动重启 (${consecutiveFailures + 1}/${MAX_FAILURES})...`);
-          consecutiveFailures++;
-          setTimeout(() => startLocalMemory(config, logger), 3000);
-        } else {
-          logger.error(`[local-memory] ❌ 连续失败 ${MAX_FAILURES} 次，停止自动重启`);
-        }
+        logger.info(`[local-memory] 服务停止，信号: ${signal}`);
+        return;
+      }
+      if (code !== 0) {
+        logger.warn(`[local-memory] 服务异常退出: ${code}`);
       }
     });
 
-    // 超时检测
     setTimeout(() => {
       if (!serviceReady) {
-        logger.warn(`[local-memory] ⚠️ 服务启动超时`);
-        resolve(false);
+        logger.warn('[local-memory] 服务启动超时');
+        settle(false);
       }
-    }, 30000);
+    }, 40000);
   });
 }
 
-function stopLocalMemory(logger: PluginLogger) {
+function stopLocalMemory(logger: PluginLogger): void {
   if (healthCheckTimer) {
     clearInterval(healthCheckTimer);
     healthCheckTimer = null;
   }
-
   if (memoryServiceProcess) {
-    logger.info(`[local-memory] 💤 正在停止 Python 记忆服务...`);
+    logger.info('[local-memory] 停止记忆服务');
     memoryServiceProcess.kill('SIGTERM');
     memoryServiceProcess = null;
-    serviceReady = false;
   }
+  serviceReady = false;
 }
 
-async function checkHealth(serviceUrl: string, logger: PluginLogger): Promise<boolean> {
+async function checkHealth(serviceUrl: string): Promise<boolean> {
   try {
     const response = await fetch(`${serviceUrl}/health`, {
-      signal: AbortSignal.timeout(5000)
+      signal: AbortSignal.timeout(5000),
     });
     return response.ok;
   } catch {
@@ -221,455 +387,450 @@ async function checkHealth(serviceUrl: string, logger: PluginLogger): Promise<bo
   }
 }
 
-function startHealthCheck(config: LocalMemoryConfig, logger: PluginLogger) {
-  const interval = config.healthCheckInterval || 60000; // 默认 1 分钟
-  const serviceUrl = config.serviceUrl || "http://127.0.0.1:37888";
-
+function startHealthCheck(config: RuntimeConfig, logger: PluginLogger): void {
+  if (healthCheckTimer) {
+    clearInterval(healthCheckTimer);
+  }
   healthCheckTimer = setInterval(async () => {
-    const healthy = await checkHealth(serviceUrl, logger);
-
-    if (!healthy && serviceReady) {
-      logger.warn(`[local-memory] ⚠️ 健康检查失败，服务可能已崩溃`);
-      serviceReady = false;
-
-      // 尝试重启
-      if (consecutiveFailures < MAX_FAILURES) {
-        logger.info(`[local-memory] 🔄 尝试自动重启...`);
-        consecutiveFailures++;
-        await startLocalMemory(config, logger);
-      }
-    } else if (healthy) {
+    const healthy = await checkHealth(config.serviceUrl);
+    if (healthy) {
       consecutiveFailures = 0;
-    }
-  }, interval);
-
-  logger.info(`[local-memory] 健康检查已启动 (间隔: ${interval / 1000}s)`);
-}
-
-// ============================================================================
-// HTTP 客户端
-// ============================================================================
-
-async function memoryGet(
-  baseUrl: string,
-  path: string,
-  logger: PluginLogger
-): Promise<Record<string, unknown> | null> {
-  try {
-    const response = await fetch(`${baseUrl}${path}`, {
-      signal: AbortSignal.timeout(10000)
-    });
-    if (!response.ok) {
-      logger.warn(`[local-memory] GET ${path} returned ${response.status}`);
-      return null;
-    }
-    return (await response.json()) as Record<string, unknown>;
-  } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error);
-    logger.warn(`[local-memory] GET ${path} failed: ${msg}`);
-    return null;
-  }
-}
-
-async function memoryPost(
-  baseUrl: string,
-  path: string,
-  body: Record<string, unknown>,
-  logger: PluginLogger
-): Promise<Record<string, unknown> | null> {
-  try {
-    const response = await fetch(`${baseUrl}${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120000) // 入库可能较慢
-    });
-    if (!response.ok) {
-      logger.warn(`[local-memory] POST ${path} returned ${response.status}`);
-      return null;
-    }
-    return (await response.json()) as Record<string, unknown>;
-  } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error);
-    logger.warn(`[local-memory] POST ${path} failed: ${msg}`);
-    return null;
-  }
-}
-
-async function memoryDelete(
-  baseUrl: string,
-  path: string,
-  logger: PluginLogger
-): Promise<Record<string, unknown> | null> {
-  try {
-    const response = await fetch(`${baseUrl}${path}`, {
-      method: "DELETE",
-      signal: AbortSignal.timeout(10000)
-    });
-    if (!response.ok) {
-      logger.warn(`[local-memory] DELETE ${path} returned ${response.status}`);
-      return null;
-    }
-    return (await response.json()) as Record<string, unknown>;
-  } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error);
-    logger.warn(`[local-memory] DELETE ${path} failed: ${msg}`);
-    return null;
-  }
-}
-
-// ============================================================================
-// 插件入口
-// ============================================================================
-
-export default function localMemoryPlugin(api: OpenClawPluginApi): void {
-  const config = (api.pluginConfig || {}) as LocalMemoryConfig;
-  const serviceUrl = config.serviceUrl || "http://127.0.0.1:37888";
-  const autoStart = config.autoStart !== false;
-  const autoInject = config.autoInject !== false;
-  const injectTopK = config.injectTopK || 3;
-  const injectThreshold = config.injectThreshold || 0.5;
-
-  // ========================================================================
-  // Service: 管理 Python 服务生命周期 + 健康检查
-  // ========================================================================
-  api.registerService({
-    id: "local-memory-service",
-    start: async (_ctx) => {
-      if (autoStart) {
-        const success = await startLocalMemory(config, api.logger);
-        if (success) {
-          startHealthCheck(config, api.logger);
-        }
-      } else {
-        api.logger.info(`[local-memory] 自动启动已禁用`);
-      }
-    },
-    stop: async (_ctx) => {
-      stopLocalMemory(api.logger);
-    }
-  });
-
-  // ========================================================================
-  // ContextEngine: 自动注入相关记忆 (支持 re-rank)
-  // ========================================================================
-  api.on("before_agent_start", async (event, ctx) => {
-    if (!autoInject || !event.prompt) return;
-
-    const result = await memoryGet(
-      serviceUrl,
-      `/recall?query=${encodeURIComponent(event.prompt)}&top_k=${injectTopK}&rerank=true`,
-      api.logger
-    );
-
-    if (!result || !result.success || !Array.isArray(result.results)) {
+      serviceReady = true;
       return;
     }
 
-    const memories = result.results as Array<{
-      content: string;
-      metadata?: Record<string, unknown>;
-      score: number;
-      rerank_score?: number;
-    }>;
-
-    // 使用 rerank_score 或原始 score
-    const filtered = memories.filter(m => (m.rerank_score || m.score) >= injectThreshold);
-    if (filtered.length === 0) return;
-
-    const memoryBlock = filtered
-      .map((m, i) => {
-        const source = m.metadata?.source || "未知来源";
-        const score = (m.rerank_score || m.score).toFixed(2);
-        return `[${i + 1}] (${source}, 相关度: ${score})\n${m.content}`;
-      })
-      .join("\n\n");
-
-    const injectionContent = `
-<local-memory>
-以下是与你当前任务相关的历史记忆，供参考：
-
-${memoryBlock}
-</local-memory>
-`.trim();
-
-    if (api.injectContext) {
-      await api.injectContext(ctx, injectionContent);
-      api.logger.info(`[local-memory] 已注入 ${filtered.length} 条相关记忆 (re-ranked)`);
-    } else {
-      api.logger.warn("[local-memory] injectContext 不可用");
+    if (!config.autoStart || consecutiveFailures >= MAX_FAILURES) {
+      logger.warn('[local-memory] 健康检查失败，已停止自动重启');
+      serviceReady = false;
+      return;
     }
+
+    logger.warn('[local-memory] 健康检查失败，尝试自动重启');
+    consecutiveFailures += 1;
+    stopLocalMemory(logger);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await startLocalMemory(config, logger);
+  }, config.healthCheckInterval);
+}
+
+async function memoryRequest(
+  baseUrl: string,
+  method: 'GET' | 'POST' | 'DELETE',
+  pathName: string,
+  logger: PluginLogger,
+  body?: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const response = await fetch(`${baseUrl}${pathName}`, {
+      method,
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(method === 'POST' ? 120000 : 10000),
+    });
+    if (!response.ok) {
+      logger.warn(`[local-memory] ${method} ${pathName} -> ${response.status}`);
+      return null;
+    }
+    return (await response.json()) as Record<string, unknown>;
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn(`[local-memory] ${method} ${pathName} 失败: ${message}`);
+    return null;
+  }
+}
+
+function appendToolEvent(sessionId: string, text: string): void {
+  if (!text.trim()) return;
+  const events = sessionToolEvents.get(sessionId) || [];
+  events.push(text.trim());
+  sessionToolEvents.set(sessionId, events.slice(-20));
+}
+
+export default function localMemoryPlugin(api: OpenClawPluginApi): void {
+  const config = (api.pluginConfig || {}) as LocalMemoryConfig;
+
+  api.registerService({
+    id: 'local-memory-service',
+    start: async (ctx) => {
+      const runtime = resolveRuntimeConfig(config, ctx);
+      activeRuntimeConfig = runtime;
+      if (!runtime.autoStart) {
+        api.logger.info('[local-memory] 自动启动已禁用');
+        return;
+      }
+      const success = await startLocalMemory(runtime, api.logger);
+      if (success) {
+        startHealthCheck(runtime, api.logger);
+      }
+    },
+    stop: async () => {
+      stopLocalMemory(api.logger);
+    },
   });
 
-  // ========================================================================
-  // Command: /mem-ingest <url> - 入库网页
-  // ========================================================================
+  api.on('before_prompt_build', async (event, ctx) => {
+    const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
+    if (!runtime.autoInject || !event.prompt?.trim()) {
+      return;
+    }
+    lastKnownWorkspaceDir = ctx.workspaceDir || lastKnownWorkspaceDir;
+
+    const sessionKey = getSessionIdentifier(ctx);
+    const result = await memoryRequest(runtime.serviceUrl, 'POST', '/context', api.logger, {
+      query: event.prompt,
+      workspace_dir: ctx.workspaceDir,
+      session_key: sessionKey,
+      route: runtime.injectStrategy,
+      top_k: runtime.injectTopK,
+    });
+
+    if (!result?.success || !Array.isArray(result.results)) {
+      return;
+    }
+
+    const eligible = (result.results as Array<Record<string, unknown>>).filter((item) => {
+      const score = typeof item.score === 'number' ? item.score : 0;
+      return score >= runtime.injectThreshold;
+    });
+    if (eligible.length === 0) {
+      return;
+    }
+
+    const content = renderInjectedContext(
+      normalizeInjectStrategy(result.route, runtime.injectStrategy),
+      eligible.map((item) => ({
+        title: typeof item.title === 'string' ? item.title : undefined,
+        layer: typeof item.layer === 'string' ? item.layer : 'project_knowledge',
+        visibility: typeof item.visibility === 'string' ? item.visibility : 'project',
+        score: typeof item.score === 'number' ? item.score : undefined,
+        summary: typeof item.summary === 'string' ? item.summary : undefined,
+        content: typeof item.content === 'string' ? item.content : '',
+      })),
+    );
+
+    api.logger.info(
+      `[local-memory] 注入 ${eligible.length} 条记忆，route=${String(result.route || runtime.injectStrategy)}`,
+    );
+    return {
+      prependContext: content,
+    };
+  });
+
+  api.on('tool_result_persist', async (event, ctx) => {
+    const sessionKey = getSessionIdentifier(ctx);
+    lastKnownWorkspaceDir = ctx.workspaceDir || lastKnownWorkspaceDir;
+    const toolName = event.toolName || 'tool';
+    const paramKeys = event.params ? Object.keys(event.params).slice(0, 4).join(', ') : '';
+    const message = flattenMessageContent(event.message?.content);
+    const line = [toolName, paramKeys ? `params=${paramKeys}` : '', message ? `msg=${message.slice(0, 180)}` : '']
+      .filter(Boolean)
+      .join(' | ');
+    appendToolEvent(sessionKey, line);
+  });
+
+  api.on('agent_end', async (event, ctx) => {
+    const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
+    if (!runtime.autoReflect || !Array.isArray(event.messages) || event.messages.length === 0) {
+      return;
+    }
+    lastKnownWorkspaceDir = ctx.workspaceDir || lastKnownWorkspaceDir;
+
+    const sessionKey = getSessionIdentifier(ctx);
+    await memoryRequest(runtime.serviceUrl, 'POST', '/reflect', api.logger, {
+      messages: event.messages,
+      tool_events: sessionToolEvents.get(sessionKey) || [],
+      workspace_dir: ctx.workspaceDir,
+      session_key: sessionKey,
+    });
+    sessionToolEvents.delete(sessionKey);
+  });
+
   api.registerCommand({
-    name: "mem-ingest",
-    description: "将网页内容入库到本地记忆系统",
+    name: 'mem-ingest',
+    description: '将网页内容写入分层记忆库',
     acceptsArgs: true,
     handler: async (cmdCtx) => {
+      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
       const raw = cmdCtx.args?.trim();
       if (!raw) {
-        return "用法: /mem-ingest <URL> [--force]\n示例: /mem-ingest https://example.com --force";
+        return '用法: /mem-ingest <URL> [--force] [--layer=project_knowledge] [--visibility=project]';
       }
 
-      const force = raw.includes("--force");
-      const url = raw.replace("--force", "").trim();
-
+      const { body, flags } = extractOptions(raw);
+      const url = body.trim();
       try {
         new URL(url);
       } catch {
         return `无效的 URL: ${url}`;
       }
 
-      const result = await memoryPost(
-        serviceUrl,
-        "/ingest/url",
-        { url, source_name: url, force },
-        api.logger
-      );
-
-      if (!result) {
-        return "❌ 记忆服务不可用";
-      }
-
-      if (result.skipped) {
-        return `⏭️ 已跳过 (原因: ${result.reason})\n使用 --force 强制重新入库`;
-      }
-
-      if (!result.success) {
-        return `❌ 入库失败: ${result.error || "未知错误"}`;
-      }
-
-      return `✅ 入库成功!\n来源: ${result.source}\n存储块数: ${result.chunks_stored}`;
-    },
-  });
-
-  // ========================================================================
-  // Command: /mem-ingest-text <name> - 入库文本
-  // ========================================================================
-  api.registerCommand({
-    name: "mem-ingest-text",
-    description: "将文本内容直接入库",
-    acceptsArgs: true,
-    handler: async (cmdCtx) => {
-      const input = cmdCtx.args?.trim();
-      if (!input) {
-        return "用法: /mem-ingest-text <名称>|<文本内容> [--force]";
-      }
-
-      const force = input.includes("--force");
-      const cleanInput = input.replace("--force", "").trim();
-      const separatorIndex = cleanInput.indexOf("|");
-
-      if (separatorIndex === -1) {
-        return "格式错误。用法: /mem-ingest-text <名称>|<文本内容>";
-      }
-
-      const name = cleanInput.slice(0, separatorIndex).trim();
-      const text = cleanInput.slice(separatorIndex + 1).trim();
-
-      if (!text) {
-        return "文本内容不能为空";
-      }
-
-      const result = await memoryPost(
-        serviceUrl,
-        "/ingest/text",
-        { text, source_name: name, force },
-        api.logger
-      );
-
-      if (!result) {
-        return `❌ 服务不可用`;
-      }
-
-      if (result.skipped) {
-        return `⏭️ 已跳过 (原因: ${result.reason})`;
-      }
-
-      if (!result.success) {
-        return `❌ 入库失败: ${result.error}`;
-      }
-
-      return `✅ 入库成功!\n名称: ${name}\n存储块数: ${result.chunks_stored}`;
-    },
-  });
-
-  // ========================================================================
-  // Command: /mem-recall <query> - 检索记忆
-  // ========================================================================
-  api.registerCommand({
-    name: "mem-recall",
-    description: "从本地记忆系统检索相关内容",
-    acceptsArgs: true,
-    handler: async (cmdCtx) => {
-      const raw = cmdCtx.args?.trim();
-      if (!raw) {
-        return "用法: /mem-recall <查询内容> [--no-rerank]";
-      }
-
-      const useRerank = !raw.includes("--no-rerank");
-      const query = raw.replace("--no-rerank", "").trim();
-
-      const result = await memoryGet(
-        serviceUrl,
-        `/recall?query=${encodeURIComponent(query)}&top_k=5&rerank=${useRerank}`,
-        api.logger
-      );
-
-      if (!result || !result.success) {
-        return `❌ 检索失败: ${result?.error || "服务不可用"}`;
-      }
-
-      const memories = result.results as Array<{
-        content: string;
-        metadata?: Record<string, unknown>;
-        score: number;
-        rerank_score?: number;
-      }>;
-
-      if (memories.length === 0) {
-        return "没有找到相关记忆";
-      }
-
-      const lines = [`🔍 检索结果 (${memories.length} 条, ${useRerank ? "已重排序" : "原始排序"}):\n`];
-      memories.forEach((m, i) => {
-        const source = m.metadata?.source || "未知";
-        const score = (m.rerank_score || m.score).toFixed(2);
-        const preview = m.content.length > 150 ? m.content.slice(0, 150) + "..." : m.content;
-        lines.push(`[${i + 1}] (相关度: ${score}) 来源: ${source}`);
-        lines.push(`    ${preview}\n`);
+      const result = await memoryRequest(runtime.serviceUrl, 'POST', '/ingest/url', api.logger, {
+        url,
+        source_name: url,
+        workspace_dir: resolveWorkspaceFromCommand(cmdCtx),
+        layer: normalizeLayer(flags.layer, 'project_knowledge'),
+        visibility: normalizeVisibility(flags.visibility, runtime.defaultVisibility),
+        force: Boolean(flags.force),
       });
 
-      return lines.join("\n");
+      if (!result?.success) {
+        return `❌ 入库失败: ${String(result?.error || '服务不可用')}`;
+      }
+      return `✅ 入库成功\n来源: ${String(result.source || url)}\n层级: ${String(result.layer)}\n隐私: ${String(result.visibility)}\n块数: ${String(result.chunks_stored || 0)}`;
     },
   });
 
-  // ========================================================================
-  // Command: /mem-cleanup - 清理记忆
-  // ========================================================================
   api.registerCommand({
-    name: "mem-cleanup",
-    description: "清理过期或指定的记忆",
+    name: 'mem-ingest-text',
+    description: '手动写入项目知识或摘要',
     acceptsArgs: true,
     handler: async (cmdCtx) => {
+      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
       const raw = cmdCtx.args?.trim();
-
       if (!raw) {
-        return [
-          "用法:",
-          "  /mem-cleanup source=<名称>    - 删除指定来源的记忆",
-          "  /mem-cleanup before=<日期>    - 删除指定日期前的记忆",
-          "",
-          "示例:",
-          "  /mem-cleanup source=旧文档",
-          "  /mem-cleanup before=2024-01-01",
-          "  /mem-cleanup source=旧文档 before=2024-06-01"
-        ].join("\n");
+        return '用法: /mem-ingest-text <名称>|<文本> [--layer=project_knowledge] [--visibility=project]';
       }
 
-      const params = new URLSearchParams();
-      const parts = raw.split(/\s+/);
+      const { body, flags } = extractOptions(raw);
+      const divider = body.indexOf('|');
+      if (divider === -1) {
+        return '格式错误。用法: /mem-ingest-text <名称>|<文本>';
+      }
 
+      const sourceName = body.slice(0, divider).trim();
+      const text = body.slice(divider + 1).trim();
+      if (!sourceName || !text) {
+        return '名称和文本都不能为空';
+      }
+
+      const result = await memoryRequest(runtime.serviceUrl, 'POST', '/ingest/text', api.logger, {
+        text,
+        source_name: sourceName,
+        workspace_dir: resolveWorkspaceFromCommand(cmdCtx),
+        layer: normalizeLayer(flags.layer, 'project_knowledge'),
+        visibility: normalizeVisibility(flags.visibility, runtime.defaultVisibility),
+        force: Boolean(flags.force),
+      });
+
+      if (!result?.success) {
+        return `❌ 入库失败: ${String(result?.error || '服务不可用')}`;
+      }
+      return `✅ 入库成功\n名称: ${sourceName}\n层级: ${String(result.layer)}\n隐私: ${String(result.visibility)}\n块数: ${String(result.chunks_stored || 0)}`;
+    },
+  });
+
+  api.registerCommand({
+    name: 'mem-pref',
+    description: '手动记录用户偏好',
+    acceptsArgs: true,
+    handler: async (cmdCtx) => {
+      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
+      const raw = cmdCtx.args?.trim();
+      if (!raw) {
+        return '用法: /mem-pref <偏好描述> [--visibility=global|project]';
+      }
+
+      const { body, flags } = extractOptions(raw);
+      const result = await memoryRequest(runtime.serviceUrl, 'POST', '/ingest/text', api.logger, {
+        text: body,
+        source_name: 'manual-preference',
+        workspace_dir: resolveWorkspaceFromCommand(cmdCtx),
+        layer: 'user_preference',
+        visibility: normalizeVisibility(flags.visibility, 'global'),
+        importance: 0.9,
+        confidence: 0.88,
+      });
+
+      if (!result?.success) {
+        return `❌ 记录偏好失败: ${String(result?.error || '服务不可用')}`;
+      }
+      return `✅ 已记录偏好\n隐私: ${String(result.visibility)}\n块数: ${String(result.chunks_stored || 0)}`;
+    },
+  });
+
+  api.registerCommand({
+    name: 'mem-recall',
+    description: '检索当前项目相关记忆',
+    acceptsArgs: true,
+    handler: async (cmdCtx) => {
+      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
+      const query = cmdCtx.args?.trim();
+      if (!query) {
+        return '用法: /mem-recall <查询>';
+      }
+
+      const result = await memoryRequest(runtime.serviceUrl, 'POST', '/recall', api.logger, {
+        query,
+        workspace_dir: resolveWorkspaceFromCommand(cmdCtx),
+        session_key: 'manual-query',
+        top_k: 6,
+      });
+
+      if (!result?.success || !Array.isArray(result.results)) {
+        return `❌ 检索失败: ${String(result?.error || '服务不可用')}`;
+      }
+
+      const memories = result.results as Array<Record<string, unknown>>;
+      if (memories.length === 0) {
+        return '没有找到相关记忆';
+      }
+
+      const lines = ['🔍 检索结果:'];
+      for (const [index, memory] of memories.entries()) {
+        const title = typeof memory.title === 'string' ? memory.title : '未命名记忆';
+        const layer = typeof memory.layer === 'string' ? memory.layer : 'unknown';
+        const visibility = typeof memory.visibility === 'string' ? memory.visibility : 'unknown';
+        const score = typeof memory.score === 'number' ? memory.score.toFixed(2) : '0.00';
+        const preview = typeof memory.summary === 'string'
+          ? memory.summary
+          : typeof memory.content === 'string'
+            ? memory.content.slice(0, 160)
+            : '';
+        lines.push(`[${index + 1}] ${title}`);
+        lines.push(`    layer=${layer} visibility=${visibility} score=${score}`);
+        lines.push(`    ${preview}`);
+      }
+      return lines.join('\n');
+    },
+  });
+
+  api.registerCommand({
+    name: 'mem-stats',
+    description: '查看分层记忆状态',
+    handler: async () => {
+      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
+      const health = await checkHealth(runtime.serviceUrl);
+      if (!health) {
+        return '❌ 记忆服务不可用';
+      }
+      const workspace = lastKnownWorkspaceDir
+        ? `?workspace_dir=${encodeURIComponent(lastKnownWorkspaceDir)}`
+        : '';
+      const stats = await memoryRequest(runtime.serviceUrl, 'GET', `/stats${workspace}`, api.logger);
+      if (!stats?.success) {
+        return '❌ 获取统计失败';
+      }
+
+      const layers = Object.entries((stats.layers || {}) as Record<string, number>)
+        .map(([key, value]) => `  - ${key}: ${value}`)
+        .join('\n') || '  (无)';
+      const visibilities = Object.entries((stats.visibilities || {}) as Record<string, number>)
+        .map(([key, value]) => `  - ${key}: ${value}`)
+        .join('\n') || '  (无)';
+      const routes = Object.entries((stats.route_usage || {}) as Record<string, number>)
+        .map(([key, value]) => `  - ${key}: ${value}`)
+        .join('\n') || '  (无)';
+
+      return [
+        `📊 Local Memory v${String(stats.version || '3')}`,
+        `服务: ${runtime.serviceUrl}`,
+        `状态: ${serviceReady ? '运行中' : '外部/未知'}`,
+        `总记忆数: ${String(stats.total_chunks || 0)}`,
+        `向量检索: ${stats.vector_enabled ? '开启' : '关闭'}`,
+        '',
+        '层级分布:',
+        layers,
+        '',
+        '隐私分布:',
+        visibilities,
+        '',
+        '注入路由:',
+        routes,
+      ].join('\n');
+    },
+  });
+
+  api.registerCommand({
+    name: 'mem-dashboard',
+    description: '打开本地记忆仪表盘',
+    handler: async () => {
+      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
+      const workspace = lastKnownWorkspaceDir
+        ? `?workspace_dir=${encodeURIComponent(lastKnownWorkspaceDir)}`
+        : '';
+      return `仪表盘地址: ${runtime.serviceUrl}/dashboard${workspace}`;
+    },
+  });
+
+  api.registerCommand({
+    name: 'mem-archive',
+    description: '归档旧的会话沉淀',
+    acceptsArgs: true,
+    handler: async (cmdCtx) => {
+      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
+      const { flags } = extractOptions(cmdCtx.args?.trim() || '');
+      const days = typeof flags.days === 'string' ? Number(flags.days) : 14;
+      const result = await memoryRequest(runtime.serviceUrl, 'POST', '/archive/compact', api.logger, {
+        days: Number.isFinite(days) ? days : 14,
+        workspace_dir: resolveWorkspaceFromCommand(cmdCtx),
+      });
+      if (!result?.success) {
+        return `❌ 归档失败: ${String(result?.error || '服务不可用')}`;
+      }
+      return `✅ 归档完成\n归档条数: ${String(result.archived_count || 0)}\n生成摘要: ${result.created_archive ? '是' : '否'}`;
+    },
+  });
+
+  api.registerCommand({
+    name: 'mem-cleanup',
+    description: '删除指定来源或指定时间之前的记忆',
+    acceptsArgs: true,
+    handler: async (cmdCtx) => {
+      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
+      const raw = cmdCtx.args?.trim();
+      if (!raw) {
+        return '用法: /mem-cleanup source=<来源> 或 /mem-cleanup before=<ISO日期>';
+      }
+      const parts = raw.split(/\s+/);
+      const params = new URLSearchParams();
       for (const part of parts) {
-        const [key, value] = part.split("=");
+        const [key, value] = part.split('=');
         if (key && value) {
           params.set(key, value);
         }
       }
-
-      const path = `/cleanup?${params.toString()}`;
-      const result = await memoryDelete(serviceUrl, path, api.logger);
-
-      if (!result) {
-        return "❌ 清理失败: 服务不可用";
+      const result = await memoryRequest(
+        runtime.serviceUrl,
+        'DELETE',
+        `/cleanup?${params.toString()}`,
+        api.logger,
+      );
+      if (!result?.success) {
+        return `❌ 清理失败: ${String(result?.error || '服务不可用')}`;
       }
-
-      if (!result.success) {
-        return `❌ 清理失败: ${result.error}`;
-      }
-
-      return `✅ 清理完成\n删除记录数: ${result.deleted_count}`;
+      return `✅ 清理完成\n删除条数: ${String(result.deleted_count || 0)}`;
     },
   });
 
-  // ========================================================================
-  // Command: /mem-stats - 查看统计
-  // ========================================================================
   api.registerCommand({
-    name: "mem-stats",
-    description: "查看本地记忆系统统计信息",
+    name: 'mem-restart',
+    description: '重启本地记忆服务',
     handler: async () => {
-      const health = await checkHealth(serviceUrl, api.logger);
-      if (!health) {
-        return `❌ 记忆服务不可用`;
-      }
-
-      const stats = await memoryGet(serviceUrl, "/stats", api.logger);
-      if (!stats) {
-        return "❌ 获取统计信息失败";
-      }
-
-      const sources = stats.sources as Record<string, number> || {};
-      const sourceList = Object.entries(sources)
-        .slice(0, 5)
-        .map(([name, count]) => `  - ${name}: ${count} 条`)
-        .join("\n");
-
-      return [
-        "📊 本地记忆系统状态 v2",
-        `服务地址: ${serviceUrl}`,
-        `进程状态: ${serviceReady ? "运行中" : "未启动/外部启动"}`,
-        `总记忆块数: ${stats.total_chunks || 0}`,
-        `唯一来源数: ${stats.unique_sources || 0}`,
-        `TTL (天): ${stats.ttl_days || "永不过期"}`,
-        "",
-        "来源分布 (Top 5):",
-        sourceList || "  (无数据)",
-        "",
-        `自动注入: ${autoInject ? "开启" : "关闭"}`,
-        `注入阈值: ${injectThreshold}`,
-      ].join("\n");
-    },
-  });
-
-  // ========================================================================
-  // Command: /mem-restart - 重启 Python 服务
-  // ========================================================================
-  api.registerCommand({
-    name: "mem-restart",
-    description: "重启 Python 记忆服务",
-    handler: async () => {
+      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
       stopLocalMemory(api.logger);
-      await new Promise(r => setTimeout(r, 2000));
-      consecutiveFailures = 0; // 重置失败计数
-      const success = await startLocalMemory(config, api.logger);
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      consecutiveFailures = 0;
+      const success = await startLocalMemory(runtime, api.logger);
       if (success) {
-        startHealthCheck(config, api.logger);
-        return "✅ 记忆服务已重启";
+        startHealthCheck(runtime, api.logger);
+        return '✅ 记忆服务已重启';
       }
-      return "❌ 重启失败";
+      return '❌ 重启失败';
     },
   });
 
-  // ========================================================================
-  // Command: /mem-health - 手动健康检查
-  // ========================================================================
   api.registerCommand({
-    name: "mem-health",
-    description: "手动检查记忆服务健康状态",
+    name: 'mem-health',
+    description: '检查记忆服务健康状态',
     handler: async () => {
-      const healthy = await checkHealth(serviceUrl, api.logger);
-
+      const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
+      const healthy = await checkHealth(runtime.serviceUrl);
       if (healthy) {
-        return `✅ 记忆服务健康\n状态: ${serviceReady ? "运行中" : "外部启动"}\n地址: ${serviceUrl}`;
-      } else {
-        return `❌ 记忆服务不可用\n地址: ${serviceUrl}\n\n使用 /mem-restart 尝试重启`;
+        return `✅ 记忆服务健康\n地址: ${runtime.serviceUrl}`;
       }
+      return `❌ 记忆服务不可用\n地址: ${runtime.serviceUrl}`;
     },
   });
 
-  api.logger.info(`[local-memory] 插件 v2 已加载 (服务: ${serviceUrl})`);
+  api.logger.info('[local-memory] 插件 v3 已加载');
 }

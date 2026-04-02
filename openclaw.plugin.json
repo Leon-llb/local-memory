@@ -1,8 +1,8 @@
 {
   "id": "local-memory",
   "name": "Local Memory",
-  "version": "2.0.0",
-  "description": "Local vector memory system with semantic chunking, dedup, TTL, and re-rank",
+  "version": "3.0.0",
+  "description": "Layered local memory for OpenClaw with project retention, preferences, auto-reflection, archive compaction, cost-aware routing, privacy tiers, and dashboard",
   "author": "Leon",
   "license": "MIT",
   "main": "index.js",
@@ -10,7 +10,14 @@
     "type": "git",
     "url": "https://github.com/your-username/openclaw-local-memory"
   },
-  "keywords": ["memory", "vector", "rag", "chromadb"],
+  "keywords": [
+    "memory",
+    "openclaw",
+    "project-memory",
+    "preferences",
+    "archive",
+    "dashboard"
+  ],
   "uiHints": {
     "serviceUrl": {
       "label": "服务地址",
@@ -21,24 +28,44 @@
       "help": "OpenClaw 启动时自动启动 Python 服务"
     },
     "autoInject": {
-      "label": "自动注入",
-      "help": "在 agent 启动时自动注入相关记忆到上下文"
+      "label": "策略注入",
+      "help": "agent 启动前自动注入分层记忆"
+    },
+    "autoReflect": {
+      "label": "自动沉淀",
+      "help": "agent 结束后自动沉淀偏好、项目知识和会话摘要"
     },
     "injectTopK": {
-      "label": "注入数量",
-      "help": "自动注入时检索的记忆条数"
+      "label": "召回数量",
+      "help": "构建注入上下文时的最大召回条数"
     },
     "injectThreshold": {
-      "label": "相似度阈值",
-      "help": "低于此值的记忆不会被注入 (0-1)"
+      "label": "注入阈值",
+      "help": "低于此分数的记忆不会注入"
+    },
+    "injectStrategy": {
+      "label": "注入策略",
+      "help": "auto/lean/balanced/deep"
+    },
+    "defaultVisibility": {
+      "label": "默认隐私",
+      "help": "private / project / global"
+    },
+    "ttlDays": {
+      "label": "默认 TTL",
+      "help": "会话型记忆默认过期天数"
     },
     "healthCheckInterval": {
       "label": "健康检查间隔",
-      "help": "检查 Python 服务健康状态的间隔 (毫秒)"
+      "help": "检查 Python 服务健康状态的间隔（毫秒）"
     },
     "scriptPath": {
-      "label": "启动脚本路径",
-      "help": "Python 服务的启动脚本路径"
+      "label": "启动脚本",
+      "help": "memory_service.py 的启动脚本路径"
+    },
+    "dbPath": {
+      "label": "数据库路径",
+      "help": "SQLite 数据库存放目录或文件"
     }
   },
   "configSchema": {
@@ -60,24 +87,46 @@
         "type": "boolean",
         "default": true
       },
+      "autoReflect": {
+        "type": "boolean",
+        "default": true
+      },
       "injectTopK": {
         "type": "integer",
         "minimum": 1,
-        "maximum": 20,
-        "default": 3
+        "maximum": 24,
+        "default": 8
       },
       "injectThreshold": {
         "type": "number",
         "minimum": 0,
         "maximum": 1,
-        "default": 0.5
+        "default": 0.18
+      },
+      "injectStrategy": {
+        "type": "string",
+        "enum": ["auto", "lean", "balanced", "deep"],
+        "default": "auto"
+      },
+      "defaultVisibility": {
+        "type": "string",
+        "enum": ["private", "project", "global"],
+        "default": "project"
       },
       "healthCheckInterval": {
         "type": "integer",
         "minimum": 10000,
         "default": 60000
       },
+      "ttlDays": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 180
+      },
       "scriptPath": {
+        "type": "string"
+      },
+      "dbPath": {
         "type": "string"
       }
     }

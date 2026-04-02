@@ -1,7 +1,7 @@
 {
   "name": "openclaw-local-memory",
-  "version": "2.0.0",
-  "description": "Local vector memory system for OpenClaw Agent with semantic chunking, dedup, TTL, and re-rank",
+  "version": "3.0.0",
+  "description": "Layered local memory system for OpenClaw with project retention, user preferences, auto-reflection, archive compaction, privacy tiers, and dashboard",
   "main": "index.js",
   "scripts": {
     "build": "tsc",
@@ -10,11 +10,10 @@
   "keywords": [
     "openclaw",
     "memory",
-    "vector",
-    "rag",
-    "chromadb",
-    "sentence-transformers",
-    "ai",
+    "project-memory",
+    "preferences",
+    "archive",
+    "dashboard",
     "agent"
   ],
   "author": "Leon",

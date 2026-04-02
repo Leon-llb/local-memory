@@ -1,23 +1,29 @@
 #!/bin/bash
-# LocalMemory 启动脚本
+# OpenClaw Local Memory 启动脚本
+
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
 PORT=${1:-37888}
+TTL_DAYS=${2:-180}
+DB_PATH=${3:-./agent_memory}
 
 echo "================================================"
-echo "  LocalMemory Service for OpenClaw"
+echo "  OpenClaw Local Memory Service"
 echo "================================================"
 echo ""
 echo "端口: $PORT"
-echo "数据库: ./agent_memory"
+echo "TTL: $TTL_DAYS"
+echo "数据库: $DB_PATH"
 echo ""
 
-# 检查依赖
-if ! python3 -c "import crawl4ai" 2>/dev/null; then
-    echo "⚠️  缺少依赖，正在安装..."
-    pip install crawl4ai sentence-transformers chromadb
-fi
+# 依赖检查：向量与抓取是可选增强，不强制阻塞启动
+python3 - <<'PY' >/dev/null 2>&1 || true
+import importlib
+mods = ["chromadb", "sentence_transformers", "crawl4ai"]
+missing = [m for m in mods if importlib.util.find_spec(m) is None]
+print(",".join(missing))
+PY
 
-# 启动服务
-python3 memory_service.py --port $PORT --db-path ./agent_memory
+python3 memory_service.py --port "$PORT" --ttl-days "$TTL_DAYS" --db-path "$DB_PATH"
