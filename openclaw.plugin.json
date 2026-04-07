@@ -2,7 +2,7 @@
   "id": "local-memory",
   "name": "Local Memory",
   "kind": "memory",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "description": "Layered local memory for OpenClaw with project retention, preferences, workflow gates, slash commands, auto-reflection, archive compaction, cost-aware routing, privacy tiers, and dashboard",
   "author": "Leon",
   "license": "MIT",

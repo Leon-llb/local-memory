@@ -1,5 +1,31 @@
 # Changelog
 
+## 3.2.1 - 2026-04-07
+
+本次版本是稳定性修复版，补齐了记忆服务自愈、同步 Hook 契约和发布元数据，重点解决“服务偶发未拉起导致会话失忆”和“日志长期残留 Promise 警告”。
+
+### Fixed
+
+- `tool_result_persist` 改为真正同步的 Hook，实现和 OpenClaw 契约一致，不再返回 Promise
+- `before_prompt_build`、`agent_end` 和记忆命令链路增加懒启动与健康探针，自愈记忆服务未启动场景
+- 数据库路径解析改稳，避免回落到扩展目录等不稳定位置
+- Python 向量模型改为后台加载，降低启动阶段卡死或健康检查误判风险
+
+### Changed
+
+- 安装副本和 OpenClaw install record 版本同步到 `3.2.1`
+- 启动就绪判定改为健康探针确认，而不是只依赖进程拉起
+- 补强 Node / Python 回归覆盖，验证服务恢复与启动阶段行为
+
+### Verified
+
+- `npm run build`
+- `npm run test`
+- `openclaw plugins inspect local-memory`
+- `openclaw plugins doctor`
+- `curl http://127.0.0.1:37888/health`
+- `curl http://127.0.0.1:37888/stats`
+
 ## 3.2.0 - 2026-04-03
 
 本次版本把原先只停留在协议层的 workflow gate，补成了真正可运行、可回归、可去重的自动化层。

@@ -1,6 +1,6 @@
 {
   "name": "openclaw-local-memory",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "description": "Layered local memory system for OpenClaw with project retention, workflow gates, slash commands, user preferences, auto-reflection, archive compaction, privacy tiers, and dashboard",
   "main": "index.js",
   "scripts": {
