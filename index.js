@@ -17,6 +17,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.__testHooks = void 0;
 const child_process_1 = require("child_process");
 const fs_1 = require("fs");
+const os_1 = __importDefault(require("os"));
 const path_1 = __importDefault(require("path"));
 let memoryServiceProcess = null;
 let serviceReady = false;
@@ -28,7 +29,10 @@ let lastKnownWorkspaceDir;
 let healthCheckInFlight = false;
 let archiveSweepInFlight = false;
 let restartInProgress = null;
+let serviceStartInProgress = null;
 const MAX_FAILURES = 3;
+const STARTUP_TIMEOUT_MS = 60_000;
+const STARTUP_POLL_INTERVAL_MS = 500;
 const sessionToolEvents = new Map();
 const workflowSessionStates = new Map();
 const memoryVirtualFiles = new Map();
@@ -505,6 +509,7 @@ function renderInjectedContext(route, memories) {
 function resolveRuntimeConfig(config, ctx) {
     const scriptPath = config.scriptPath || path_1.default.resolve(__dirname, 'start.sh');
     const serviceUrl = config.serviceUrl || 'http://127.0.0.1:37888';
+    const dbPath = config.dbPath || resolveDefaultDbPath(ctx);
     return {
         serviceUrl,
         autoStart: asBoolean(config.autoStart, true),
@@ -518,13 +523,32 @@ function resolveRuntimeConfig(config, ctx) {
         injectThreshold: asNumber(config.injectThreshold, 0.18),
         injectStrategy: normalizeInjectStrategy(config.injectStrategy, 'auto'),
         scriptPath,
-        dbPath: config.dbPath || (ctx ? path_1.default.join(ctx.stateDir, 'agent-memory') : path_1.default.resolve(__dirname, 'agent_memory')),
+        dbPath,
         healthCheckInterval: asNumber(config.healthCheckInterval, 60000),
         ttlDays: asNumber(config.ttlDays, 180),
         defaultVisibility: normalizeVisibility(config.defaultVisibility, 'project'),
     };
 }
+function resolveDefaultDbPath(ctx) {
+    if (ctx?.stateDir) {
+        const stateDir = path_1.default.resolve(ctx.stateDir);
+        if (!stateDir.includes(`${path_1.default.sep}extensions${path_1.default.sep}`)) {
+            return path_1.default.join(stateDir, 'agent-memory');
+        }
+    }
+    return path_1.default.join(resolveOpenClawHome(), 'agent-memory');
+}
+function resolveOpenClawHome() {
+    const configuredHome = process.env.OPENCLAW_HOME?.trim();
+    if (configuredHome) {
+        return configuredHome;
+    }
+    return path_1.default.join(process.env.HOME || os_1.default.homedir(), '.openclaw');
+}
 async function startLocalMemory(config, logger) {
+    if (serviceStartInProgress) {
+        return serviceStartInProgress;
+    }
     if (memoryServiceProcess) {
         if (serviceReady) {
             return true;
@@ -536,7 +560,7 @@ async function startLocalMemory(config, logger) {
     const cwdPath = path_1.default.dirname(scriptPath);
     const port = getPortFromUrl(config.serviceUrl);
     serviceReady = false;
-    return new Promise((resolve) => {
+    serviceStartInProgress = new Promise((resolve) => {
         let settled = false;
         const settle = (value) => {
             if (settled)
@@ -578,19 +602,42 @@ async function startLocalMemory(config, logger) {
             memoryServiceProcess = null;
             if (signal) {
                 logger.info(`[local-memory] 服务停止，信号: ${signal}`);
+                settle(false);
                 return;
             }
             if (code !== 0) {
                 logger.warn(`[local-memory] 服务异常退出: ${code}`);
             }
+            settle(false);
         });
-        setTimeout(() => {
-            if (!serviceReady) {
-                logger.warn('[local-memory] 服务启动超时');
-                settle(false);
+        void (async () => {
+            const deadline = Date.now() + STARTUP_TIMEOUT_MS;
+            while (Date.now() < deadline) {
+                if (!memoryServiceProcess) {
+                    settle(false);
+                    return;
+                }
+                if (serviceReady) {
+                    settle(true);
+                    return;
+                }
+                if (await healthProbe(config.serviceUrl)) {
+                    serviceReady = true;
+                    consecutiveFailures = 0;
+                    logger.info('[local-memory] 服务已通过健康探针就绪');
+                    settle(true);
+                    return;
+                }
+                await sleepImpl(STARTUP_POLL_INTERVAL_MS);
             }
-        }, 40000);
+            logger.warn('[local-memory] 服务启动超时');
+            settle(false);
+        })();
+    }).finally(() => {
+        serviceStartInProgress = null;
     });
+    const pendingStartup = serviceStartInProgress;
+    return pendingStartup;
 }
 function clearServiceTimers() {
     if (healthCheckTimer) {
@@ -615,6 +662,7 @@ function stopLocalMemory(logger) {
     healthCheckInFlight = false;
     archiveSweepInFlight = false;
     restartInProgress = null;
+    serviceStartInProgress = null;
     stopLocalMemoryProcess(logger);
 }
 async function checkHealth(serviceUrl) {
@@ -676,8 +724,34 @@ async function restartLocalMemory(config, logger, reason) {
     });
     return restartInProgress;
 }
+async function ensureLocalMemoryReady(config, logger, reason) {
+    const healthy = await healthProbe(config.serviceUrl);
+    if (healthy) {
+        serviceReady = true;
+        consecutiveFailures = 0;
+        if (config.autoStart) {
+            startHealthCheck(config, logger);
+            startArchiveSchedule(config, logger);
+        }
+        return true;
+    }
+    serviceReady = false;
+    if (!config.autoStart) {
+        logger.warn(`[local-memory] ${reason}，但自动启动已禁用`);
+        return false;
+    }
+    logger.warn(`[local-memory] ${reason}，尝试恢复记忆服务`);
+    const success = await serviceStartImpl(config, logger);
+    if (success) {
+        serviceReady = true;
+        consecutiveFailures = 0;
+        startHealthCheck(config, logger);
+        startArchiveSchedule(config, logger);
+    }
+    return success;
+}
 async function runHealthCheckCycle(config, logger) {
-    if (healthCheckInFlight || restartInProgress) {
+    if (healthCheckInFlight || restartInProgress || serviceStartInProgress) {
         return;
     }
     healthCheckInFlight = true;
@@ -713,7 +787,7 @@ function startHealthCheck(config, logger) {
     }, config.healthCheckInterval);
 }
 async function runArchiveCycle(config, logger) {
-    if (!config.autoArchive || archiveSweepInFlight || restartInProgress) {
+    if (!config.autoArchive || archiveSweepInFlight || restartInProgress || serviceStartInProgress) {
         return;
     }
     archiveSweepInFlight = true;
@@ -788,6 +862,10 @@ function sliceVirtualFile(text, from, lines) {
 function buildMemorySearchManager(runtime, logger) {
     return {
         async search(query, opts) {
+            const ready = await ensureLocalMemoryReady(runtime, logger, '检索前服务不可用');
+            if (!ready) {
+                return [];
+            }
             const result = await memoryRequest(runtime.serviceUrl, 'POST', '/recall', logger, {
                 query,
                 workspace_dir: lastKnownWorkspaceDir,
@@ -858,11 +936,22 @@ function buildMemorySearchManager(runtime, logger) {
             };
         },
         async sync(params) {
+            const ready = await ensureLocalMemoryReady(runtime, logger, '归档同步前服务不可用');
+            if (!ready) {
+                return;
+            }
             params?.progress?.({ completed: 0, total: 1, label: 'archive compact' });
             await archiveSweepImpl(runtime, logger, lastKnownWorkspaceDir);
             params?.progress?.({ completed: 1, total: 1, label: 'archive compact' });
         },
         async probeEmbeddingAvailability() {
+            const ready = await ensureLocalMemoryReady(runtime, logger, '探测 embedding 前服务不可用');
+            if (!ready) {
+                return {
+                    ok: false,
+                    error: 'memory service unavailable',
+                };
+            }
             const stats = await memoryRequest(runtime.serviceUrl, 'GET', '/stats', logger);
             const ok = Boolean(stats?.vector_enabled);
             return {
@@ -871,6 +960,10 @@ function buildMemorySearchManager(runtime, logger) {
             };
         },
         async probeVectorAvailability() {
+            const ready = await ensureLocalMemoryReady(runtime, logger, '探测向量能力前服务不可用');
+            if (!ready) {
+                return false;
+            }
             const stats = await memoryRequest(runtime.serviceUrl, 'GET', '/stats', logger);
             return Boolean(stats?.vector_enabled);
         },
@@ -943,29 +1036,35 @@ function registerLocalMemoryPlugin(api) {
             }
         }
         if (runtime.autoInject) {
-            const result = await memoryRequest(runtime.serviceUrl, 'POST', '/context', api.logger, {
-                query: event.prompt,
-                workspace_dir: ctx.workspaceDir,
-                session_key: sessionKey,
-                route: runtime.injectStrategy,
-                top_k: runtime.injectTopK,
-            });
-            if (result?.success && Array.isArray(result.results)) {
-                const eligible = result.results.filter((item) => {
-                    const score = typeof item.score === 'number' ? item.score : 0;
-                    return score >= runtime.injectThreshold;
+            const ready = await ensureLocalMemoryReady(runtime, api.logger, '构建提示词前记忆服务不可用');
+            if (!ready) {
+                api.logger.warn('[local-memory] 跳过记忆注入，服务仍不可用');
+            }
+            else {
+                const result = await memoryRequest(runtime.serviceUrl, 'POST', '/context', api.logger, {
+                    query: event.prompt,
+                    workspace_dir: ctx.workspaceDir,
+                    session_key: sessionKey,
+                    route: runtime.injectStrategy,
+                    top_k: runtime.injectTopK,
                 });
-                if (eligible.length > 0) {
-                    const content = renderInjectedContext(normalizeInjectStrategy(result.route, runtime.injectStrategy), eligible.map((item) => ({
-                        title: typeof item.title === 'string' ? item.title : undefined,
-                        layer: typeof item.layer === 'string' ? item.layer : 'project_knowledge',
-                        visibility: typeof item.visibility === 'string' ? item.visibility : 'project',
-                        score: typeof item.score === 'number' ? item.score : undefined,
-                        summary: typeof item.summary === 'string' ? item.summary : undefined,
-                        content: typeof item.content === 'string' ? item.content : '',
-                    })));
-                    api.logger.info(`[local-memory] 注入 ${eligible.length} 条记忆，route=${String(result.route || runtime.injectStrategy)}`);
-                    sections.push(content);
+                if (result?.success && Array.isArray(result.results)) {
+                    const eligible = result.results.filter((item) => {
+                        const score = typeof item.score === 'number' ? item.score : 0;
+                        return score >= runtime.injectThreshold;
+                    });
+                    if (eligible.length > 0) {
+                        const content = renderInjectedContext(normalizeInjectStrategy(result.route, runtime.injectStrategy), eligible.map((item) => ({
+                            title: typeof item.title === 'string' ? item.title : undefined,
+                            layer: typeof item.layer === 'string' ? item.layer : 'project_knowledge',
+                            visibility: typeof item.visibility === 'string' ? item.visibility : 'project',
+                            score: typeof item.score === 'number' ? item.score : undefined,
+                            summary: typeof item.summary === 'string' ? item.summary : undefined,
+                            content: typeof item.content === 'string' ? item.content : '',
+                        })));
+                        api.logger.info(`[local-memory] 注入 ${eligible.length} 条记忆，route=${String(result.route || runtime.injectStrategy)}`);
+                        sections.push(content);
+                    }
                 }
             }
         }
@@ -977,7 +1076,7 @@ function registerLocalMemoryPlugin(api) {
             prependSystemContext,
         };
     });
-    api.on('tool_result_persist', async (event, ctx) => {
+    api.on('tool_result_persist', (event, ctx) => {
         const sessionKey = getSessionIdentifier(ctx);
         lastKnownWorkspaceDir = ctx.workspaceDir || lastKnownWorkspaceDir;
         const toolName = event.toolName || 'tool';
@@ -994,6 +1093,11 @@ function registerLocalMemoryPlugin(api) {
         const sessionKey = getSessionIdentifier(ctx);
         try {
             if (!runtime.autoReflect || !Array.isArray(event.messages) || event.messages.length === 0) {
+                return;
+            }
+            const ready = await ensureLocalMemoryReady(runtime, api.logger, '会话沉淀前记忆服务不可用');
+            if (!ready) {
+                api.logger.warn('[local-memory] 跳过自动沉淀，服务仍不可用');
                 return;
             }
             await memoryRequest(runtime.serviceUrl, 'POST', '/reflect', api.logger, {
@@ -1096,6 +1200,10 @@ function registerLocalMemoryPlugin(api) {
             catch {
                 return `无效的 URL: ${url}`;
             }
+            const ready = await ensureLocalMemoryReady(runtime, api.logger, '手动入库前记忆服务不可用');
+            if (!ready) {
+                return '❌ 入库失败: 服务不可用';
+            }
             const result = await memoryRequest(runtime.serviceUrl, 'POST', '/ingest/url', api.logger, {
                 url,
                 source_name: url,
@@ -1130,6 +1238,10 @@ function registerLocalMemoryPlugin(api) {
             if (!sourceName || !text) {
                 return '名称和文本都不能为空';
             }
+            const ready = await ensureLocalMemoryReady(runtime, api.logger, '手动写入文本前记忆服务不可用');
+            if (!ready) {
+                return '❌ 入库失败: 服务不可用';
+            }
             const result = await memoryRequest(runtime.serviceUrl, 'POST', '/ingest/text', api.logger, {
                 text,
                 source_name: sourceName,
@@ -1155,6 +1267,10 @@ function registerLocalMemoryPlugin(api) {
                 return '用法: /mem-pref <偏好描述> [--visibility=global|project]';
             }
             const { body, flags } = extractOptions(raw);
+            const ready = await ensureLocalMemoryReady(runtime, api.logger, '记录偏好前记忆服务不可用');
+            if (!ready) {
+                return '❌ 记录偏好失败: 服务不可用';
+            }
             const result = await memoryRequest(runtime.serviceUrl, 'POST', '/ingest/text', api.logger, {
                 text: body,
                 source_name: 'manual-preference',
@@ -1179,6 +1295,10 @@ function registerLocalMemoryPlugin(api) {
             const query = cmdCtx.args?.trim();
             if (!query) {
                 return '用法: /mem-recall <查询>';
+            }
+            const ready = await ensureLocalMemoryReady(runtime, api.logger, '检索记忆前记忆服务不可用');
+            if (!ready) {
+                return '❌ 检索失败: 服务不可用';
             }
             const result = await memoryRequest(runtime.serviceUrl, 'POST', '/recall', api.logger, {
                 query,
@@ -1216,8 +1336,8 @@ function registerLocalMemoryPlugin(api) {
         description: '查看分层记忆状态',
         handler: async () => {
             const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
-            const health = await checkHealth(runtime.serviceUrl);
-            if (!health) {
+            const ready = await ensureLocalMemoryReady(runtime, api.logger, '读取统计前记忆服务不可用');
+            if (!ready) {
                 return '❌ 记忆服务不可用';
             }
             const workspace = lastKnownWorkspaceDir
@@ -1273,6 +1393,10 @@ function registerLocalMemoryPlugin(api) {
             const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
             const { flags } = extractOptions(cmdCtx.args?.trim() || '');
             const days = typeof flags.days === 'string' ? Number(flags.days) : 14;
+            const ready = await ensureLocalMemoryReady(runtime, api.logger, '手动归档前记忆服务不可用');
+            if (!ready) {
+                return '❌ 归档失败: 服务不可用';
+            }
             const result = await memoryRequest(runtime.serviceUrl, 'POST', '/archive/compact', api.logger, {
                 days: Number.isFinite(days) ? days : 14,
                 workspace_dir: resolveWorkspaceFromCommand(cmdCtx),
@@ -1300,6 +1424,10 @@ function registerLocalMemoryPlugin(api) {
                 if (key && value) {
                     params.set(key, value);
                 }
+            }
+            const ready = await ensureLocalMemoryReady(runtime, api.logger, '清理记忆前记忆服务不可用');
+            if (!ready) {
+                return '❌ 清理失败: 服务不可用';
             }
             const result = await memoryRequest(runtime.serviceUrl, 'DELETE', `/cleanup?${params.toString()}`, api.logger);
             if (!result?.success) {
@@ -1330,8 +1458,8 @@ function registerLocalMemoryPlugin(api) {
         description: '检查记忆服务健康状态',
         handler: async () => {
             const runtime = activeRuntimeConfig || resolveRuntimeConfig(config, null);
-            const healthy = await checkHealth(runtime.serviceUrl);
-            if (healthy) {
+            const ready = await ensureLocalMemoryReady(runtime, api.logger, '检查健康状态时记忆服务不可用');
+            if (ready) {
                 return `✅ 记忆服务健康\n地址: ${runtime.serviceUrl}`;
             }
             return `❌ 记忆服务不可用\n地址: ${runtime.serviceUrl}`;
@@ -1356,6 +1484,7 @@ exports.__testHooks = {
             healthCheckInFlight,
             archiveSweepInFlight,
             restartActive: Boolean(restartInProgress),
+            startActive: Boolean(serviceStartInProgress),
         };
     },
     resetState() {
@@ -1369,6 +1498,7 @@ exports.__testHooks = {
         healthCheckInFlight = false;
         archiveSweepInFlight = false;
         restartInProgress = null;
+        serviceStartInProgress = null;
         blackboardRoot = DEFAULT_BLACKBOARD_ROOT;
     },
     setHooks(overrides) {
@@ -1397,6 +1527,9 @@ exports.__testHooks = {
     startArchiveSchedule(config, logger = noopLogger) {
         startArchiveSchedule(config, logger);
     },
+    ensureReady(config, logger = noopLogger, reason = '测试触发') {
+        return ensureLocalMemoryReady(config, logger, reason);
+    },
     stopAll(logger = noopLogger) {
         stopLocalMemory(logger);
     },
@@ -1414,5 +1547,8 @@ exports.__testHooks = {
     },
     registerPlugin(api) {
         registerLocalMemoryPlugin(api);
+    },
+    resolveRuntimeConfig(config, ctx) {
+        return resolveRuntimeConfig(config, ctx);
     },
 };

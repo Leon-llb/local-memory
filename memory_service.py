@@ -237,29 +237,63 @@ class EmbeddingProvider:
         self.enabled = False
         self.model = None
         self.model_name = os.getenv("LOCAL_MEMORY_EMBED_MODEL", "BAAI/bge-small-zh-v1.5")
+        self.loading = False
+        self.load_error: Optional[str] = None
+        self._lock = threading.RLock()
+        self._load_thread: Optional[threading.Thread] = None
         if SentenceTransformer is None:
+            self.load_error = "SentenceTransformer unavailable"
             Logger.log("SentenceTransformer 未安装，回退为词法检索", "warn")
             return
+        self.loading = True
+        self._load_thread = threading.Thread(
+            target=self._load_model,
+            name="local-memory-embed-loader",
+            daemon=True,
+        )
+        self._load_thread.start()
+        Logger.log(f"向量模型后台加载中: {self.model_name}")
+
+    def _load_model(self) -> None:
+        start = time.time()
         try:
-            start = time.time()
-            self.model = SentenceTransformer(self.model_name)
-            self.enabled = True
+            model = SentenceTransformer(self.model_name)
+            with self._lock:
+                self.model = model
+                self.enabled = True
+                self.loading = False
+                self.load_error = None
             Logger.log(
                 f"向量模型已加载: {self.model_name} ({time.time() - start:.2f}s)",
                 "success",
             )
         except Exception as exc:
+            with self._lock:
+                self.model = None
+                self.enabled = False
+                self.loading = False
+                self.load_error = str(exc)
             Logger.log(f"向量模型加载失败，回退为词法检索: {exc}", "warn")
-            self.model = None
-            self.enabled = False
+
+    def status(self) -> str:
+        if self.enabled:
+            return "ready"
+        if self.loading:
+            return "loading"
+        if SentenceTransformer is None:
+            return "disabled"
+        return "degraded"
 
     def encode_many(self, texts: List[str]) -> List[Optional[List[float]]]:
         if not texts:
             return []
-        if not self.enabled or self.model is None:
+        with self._lock:
+            model = self.model
+            enabled = self.enabled
+        if not enabled or model is None:
             return [None for _ in texts]
         try:
-            vectors = self.model.encode(texts, show_progress_bar=False).tolist()
+            vectors = model.encode(texts, show_progress_bar=False).tolist()
             return [list(map(float, vector)) for vector in vectors]
         except Exception as exc:
             Logger.log(f"向量编码失败: {exc}", "warn")
@@ -1415,6 +1449,8 @@ class LocalMemoryEngine:
             "version": VERSION,
             "ttl_days": self.ttl_days,
             "vector_enabled": self.embeddings.enabled,
+            "vector_status": self.embeddings.status(),
+            "vector_model": self.embeddings.model_name,
             "total_chunks": int(total_active),
             "unique_sources": len(source_rows),
             "layers": {row["layer"]: int(row["count"]) for row in layer_rows},
@@ -1746,6 +1782,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "service": "local-memory",
                     "version": VERSION,
                     "vector_enabled": engine.embeddings.enabled,
+                    "vector_status": engine.embeddings.status(),
+                    "vector_model": engine.embeddings.model_name,
                 }
             )
             return

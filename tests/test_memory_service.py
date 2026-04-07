@@ -159,5 +159,36 @@ class ThreadedServerTests(LocalMemoryTestCase):
         self.assertTrue(ingest_result["value"]["success"])
 
 
+class EmbeddingStartupTests(LocalMemoryTestCase):
+    def test_engine_init_does_not_block_on_slow_embedding_model(self) -> None:
+        class SlowSentenceTransformer:
+            def __init__(self, model_name: str) -> None:
+                time.sleep(0.6)
+                self.model_name = model_name
+
+            def encode(self, texts, show_progress_bar=False):
+                return [[0.1, 0.2] for _ in texts]
+
+        memory_module.SentenceTransformer = SlowSentenceTransformer
+
+        started = time.monotonic()
+        engine = memory_module.LocalMemoryEngine(
+            db_path=str(Path(self.temp_dir.name) / "memory"),
+            ttl_days=30,
+        )
+        elapsed = time.monotonic() - started
+        self.addCleanup(engine.db.close)
+
+        self.assertLess(elapsed, 0.3)
+        self.assertEqual(engine.embeddings.status(), "loading")
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and engine.embeddings.status() == "loading":
+            time.sleep(0.05)
+
+        self.assertEqual(engine.embeddings.status(), "ready")
+        self.assertTrue(engine.embeddings.enabled)
+
+
 if __name__ == "__main__":
     unittest.main()

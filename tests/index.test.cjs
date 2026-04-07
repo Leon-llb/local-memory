@@ -114,6 +114,34 @@ test('archive scheduler runs periodic sweep', async () => {
   assert.equal(state.archiveActive, true);
 });
 
+test('ensureReady lazily starts service and arms supervisors', async () => {
+  let healthCalls = 0;
+  let startCalls = 0;
+
+  __testHooks.setHooks({
+    checkHealth: async () => {
+      healthCalls += 1;
+      return healthCalls >= 2;
+    },
+    startService: async () => {
+      startCalls += 1;
+      return true;
+    },
+    sleep: async () => undefined,
+  });
+
+  const ready = await __testHooks.ensureReady({ ...baseConfig }, logger, '测试自愈');
+  const state = __testHooks.getState();
+
+  assert.equal(ready, true);
+  assert.equal(startCalls, 1);
+  assert.equal(healthCalls, 1);
+  assert.equal(state.serviceReady, true);
+  assert.equal(state.healthCheckActive, true);
+  assert.equal(state.archiveActive, true);
+  assert.equal(state.startActive, false);
+});
+
 test('workflow decision marks high-risk prompt for advisor and verification', () => {
   const prompt = `
   请把 openclaw 的记忆管理系统和插件 hook 全面升级，涉及 memory 路由、隐私、自动化、发布前验证、回归测试和配置变更。
@@ -195,4 +223,30 @@ test('workflow commands create blackboard artifacts', async () => {
   assert.match(await fs.readFile(delegateFile, 'utf8'), /skill: openclaw-delegation/);
   assert.match(await fs.readFile(advisorFile, 'utf8'), /stage: before-release/);
   assert.match(await fs.readFile(verifyFile, 'utf8'), /skill: openclaw-verification-gate/);
+});
+
+test('runtime config uses stable openclaw home when stateDir resolves under extensions', () => {
+  const previousHome = process.env.OPENCLAW_HOME;
+  process.env.OPENCLAW_HOME = '/tmp/openclaw-home';
+
+  try {
+    const runtime = __testHooks.resolveRuntimeConfig(
+      {
+        serviceUrl: 'http://127.0.0.1:37888',
+      },
+      {
+        config: {},
+        stateDir: '/Users/leon/.openclaw/extensions/local-memory',
+        logger,
+      },
+    );
+
+    assert.equal(runtime.dbPath, '/tmp/openclaw-home/agent-memory');
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.OPENCLAW_HOME;
+    } else {
+      process.env.OPENCLAW_HOME = previousHome;
+    }
+  }
 });
